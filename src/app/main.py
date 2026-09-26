@@ -146,13 +146,7 @@ async def verify_webhook(request: Request):
 # in the database if a plan needs to change later). If either is missing
 # for some reason, the clinic is always treated as active so it's never
 # accidentally blocked.
-SUBSCRIPTION_PLAN_DAYS = {
-    "trial": 7,
-    "1_month": 30,
-    "3_months": 90,
-    "6_months": 180,
-    "12_months": 365,
-}
+SUBSCRIPTION_PLAN_DAYS = clinics_store.SUBSCRIPTION_PLAN_DAYS
 
 
 def is_subscription_active(clinic: dict) -> bool:

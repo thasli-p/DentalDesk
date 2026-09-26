@@ -71,6 +71,9 @@ def _load_clinic(slug: str) -> dict:
     clinic = clinics_store.get_clinic_by_slug(slug)
     if not clinic or not clinic.get("active"):
         raise HTTPException(status_code=404, detail="Clinic not found or inactive.")
+    if not clinic.get("voice_enabled"):
+        # Voice is a separate paid tier, switched on per clinic in /admin/clinics.
+        raise HTTPException(status_code=403, detail="Voice receptionist is not enabled for this clinic.")
     db.set_current_db_path(clinic["db_path"])
     return clinic
 
@@ -775,8 +778,8 @@ def _pick_clinic_for_call(data: dict) -> Optional[dict]:
     slug = dyn.get("clinic_slug") or os.environ.get("VOICE_DEFAULT_CLINIC_SLUG")
     if slug:
         clinic = clinics_store.get_clinic_by_slug(slug)
-        return clinic if clinic and clinic.get("active") else None
-    active = [c for c in clinics_store.list_clinics() if c.get("active")]
+        return clinic if clinic and clinic.get("active") and clinic.get("voice_enabled") else None
+    active = [c for c in clinics_store.list_clinics() if c.get("active") and c.get("voice_enabled")]
     return active[0] if len(active) == 1 else None
 
 

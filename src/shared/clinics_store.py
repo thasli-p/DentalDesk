@@ -26,7 +26,7 @@ import sqlite3
 import secrets
 import logging
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS clinics (
     subscription_started_at TEXT NOT NULL,
 
     dashboard_password TEXT,
+    voice_enabled INTEGER NOT NULL DEFAULT 0,
 
     db_path TEXT NOT NULL,
     config_path TEXT NOT NULL,
@@ -113,6 +114,13 @@ def init_control_db():
         if "dashboard_password" not in existing_columns:
             conn.execute("ALTER TABLE clinics ADD COLUMN dashboard_password TEXT")
             logger.info("Migrated clinics table: added dashboard_password column.")
+        if "voice_enabled" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN voice_enabled INTEGER NOT NULL DEFAULT 0")
+            # The clinic already piloting the phone agent keeps working.
+            pilot = os.environ.get("VOICE_DEFAULT_CLINIC_SLUG")
+            if pilot:
+                conn.execute("UPDATE clinics SET voice_enabled=1 WHERE slug=?", (pilot,))
+            logger.info("Migrated clinics table: added voice_enabled column.")
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -121,7 +129,44 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     d["services"] = json.loads(d.pop("services_json") or "[]")
     d["dentists"] = json.loads(d.pop("dentists_json") or "[]")
     d["active"] = bool(d["active"])
+    d["voice_enabled"] = bool(d.get("voice_enabled"))
     return d
+
+
+# Length of each subscription plan, in days. Shared by the WhatsApp cutoff
+# (app/main.py) and the admin page's "days left before renewal" column.
+SUBSCRIPTION_PLAN_DAYS = {
+    "trial": 7,
+    "1_month": 30,
+    "3_months": 90,
+    "6_months": 180,
+    "12_months": 365,
+}
+
+
+def subscription_ends_on(clinic: Dict[str, Any]) -> Optional[datetime]:
+    """The date this clinic's current plan runs out (None if unknown)."""
+    days = SUBSCRIPTION_PLAN_DAYS.get(clinic.get("subscription_plan") or "")
+    started = clinic.get("subscription_started_at")
+    if not days or not started:
+        return None
+    try:
+        return datetime.strptime(started, "%Y-%m-%d") + timedelta(days=days)
+    except ValueError:
+        return None
+
+
+def subscription_days_left(clinic: Dict[str, Any]) -> Optional[int]:
+    """Whole days until renewal (0 or negative = expired), None if unknown."""
+    ends = subscription_ends_on(clinic)
+    if not ends:
+        return None
+    return (ends.date() - datetime.now().date()).days
+
+
+def set_voice_enabled(clinic_id: int, enabled: bool):
+    with _db() as conn:
+        conn.execute("UPDATE clinics SET voice_enabled=? WHERE id=?", (1 if enabled else 0, clinic_id))
 
 
 def slugify(name: str) -> str:
@@ -229,6 +274,7 @@ def add_clinic(
     dentists: Optional[List[Dict[str, Any]]] = None,
     subscription_plan: str = "trial",
     subscription_started_at: Optional[str] = None,
+    voice_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Adds a new clinic and creates its own private data folder
     (data/clinics/<slug>/) for its database, config file, and uploaded
@@ -255,9 +301,9 @@ def add_clinic(
                 general_hours, parking, phone, address, google_maps_link,
                 offers_text, offers_image_filename,
                 holidays_json, services_json, dentists_json,
-                subscription_plan, subscription_started_at, dashboard_password,
+                subscription_plan, subscription_started_at, dashboard_password, voice_enabled,
                 db_path, config_path, static_dir, created_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug, name,
@@ -265,7 +311,7 @@ def add_clinic(
                 general_hours, parking, phone, address, google_maps_link,
                 offers_text, offers_image_filename,
                 json.dumps(holidays or []), json.dumps(services or []), json.dumps(dentists or []),
-                subscription_plan, started_at, dashboard_password,
+                subscription_plan, started_at, dashboard_password, 1 if voice_enabled else 0,
                 db_path, config_path, static_dir, datetime.now().isoformat(),
             ),
         )

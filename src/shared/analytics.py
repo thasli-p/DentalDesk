@@ -174,7 +174,8 @@ def get_dashboard_summary(
         if conv_ids:
             placeholders = ",".join("?" for _ in conv_ids)
             msg_rows = conn.execute(
-                f"SELECT conversation_id, created_at FROM messages WHERE conversation_id IN ({placeholders})",
+                f"SELECT conversation_id, created_at FROM messages WHERE conversation_id IN ({placeholders}) "
+                f"AND sender IN ('user','agent')",
                 conv_ids,
             ).fetchall()
             for m in msg_rows:
@@ -285,7 +286,8 @@ def get_dashboard_summary(
             placeholders = ",".join("?" for _ in list_conv_ids)
             for row in conn.execute(
                 f"SELECT conversation_id, COUNT(*) as cnt FROM messages "
-                f"WHERE conversation_id IN ({placeholders}) GROUP BY conversation_id",
+                f"WHERE conversation_id IN ({placeholders}) AND sender IN ('user','agent') "
+                f"GROUP BY conversation_id",
                 list_conv_ids,
             ).fetchall():
                 list_message_count_by_conv[row["conversation_id"]] = row["cnt"]

@@ -143,7 +143,7 @@ def _subscribe_waba(waba_id: str, access_token: str) -> dict:
 # -------------------------
 PAGE_STYLE = """
 <style>
-  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 1150px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
   .brand-row { display: flex; align-items: center; gap: 16px; }
   .brand-row img { width: 128px; height: 128px; border-radius: 24px; flex: none; }
   h1 { font-size: 22px; margin: 0; }
@@ -167,8 +167,43 @@ PAGE_STYLE = """
   .delete-form { margin: 0; }
   .delete-btn { margin: 0; padding: 5px 12px; font-size: 12px; background: #cf222e; }
   .delete-btn:hover { background: #a40e24; }
+  .days-ok { color: #1a7f37; font-weight: 600; }
+  .days-soon { display: inline-block; background: #fff4e5; color: #9a5b00; border: 1px solid #f0b35b; border-radius: 10px; padding: 1px 8px; font-weight: 600; }
+  .days-expired { display: inline-block; background: #ffeef0; color: #cf222e; border: 1px solid #cf222e; border-radius: 10px; padding: 1px 8px; font-weight: 600; }
+  .voice-on { color: #1a7f37; font-weight: 600; }
+  .voice-off { color: #999; }
+  .small-btn { margin: 4px 0 0; padding: 4px 10px; font-size: 12px; background: #555; }
+  .small-btn:hover { background: #333; }
+  .check-label { display: flex; align-items: flex-start; gap: 8px; font-weight: 600; }
+  .check-label input { margin-top: 3px; }
 </style>
 """
+
+
+RENEWAL_WARNING_DAYS = 30
+
+
+def _days_left_html(clinic: dict) -> str:
+    """Days until this clinic's plan runs out, flagged when under a month."""
+    left = clinics_store.subscription_days_left(clinic)
+    if left is None:
+        return '<span class="hint">unknown</span>'
+    ends = clinics_store.subscription_ends_on(clinic).strftime("%Y-%m-%d")
+    if left <= 0:
+        return f'<span class="days-expired">⛔ Expired</span><br><span class="hint">ended {ends}</span>'
+    label = f"{left} day{'s' if left != 1 else ''}"
+    if left < RENEWAL_WARNING_DAYS:
+        return f'<span class="days-soon">⚠️ {label}</span><br><span class="hint">renew by {ends}</span>'
+    return f'<span class="days-ok">{label}</span><br><span class="hint">renews {ends}</span>'
+
+
+def _renewal_summary_html(clinics: list) -> str:
+    due = [c for c in clinics if (clinics_store.subscription_days_left(c) or 99999) < RENEWAL_WARNING_DAYS]
+    if not due:
+        return ""
+    names = ", ".join(html.escape(c["name"]) for c in due)
+    return (f'<div class="flash-err" style="white-space:normal">⚠️ {len(due)} clinic'
+            f'{"s" if len(due) != 1 else ""} due for renewal within a month (or already expired): {names}</div>')
 
 
 def _render_page(message_html: str = "") -> str:
@@ -182,7 +217,15 @@ def _render_page(message_html: str = "") -> str:
                 <td>{html.escape(c['name'])}</td>
                 <td>{html.escape(c['slug'])}</td>
                 <td>{html.escape(c['whatsapp_phone_number_id'])}</td>
-                <td>{html.escape(c['subscription_plan'])} (since {html.escape(c['subscription_started_at'])})</td>
+                <td>{html.escape(c['subscription_plan'].replace('_', ' '))}<br><span class="hint">since {html.escape(c['subscription_started_at'])}</span></td>
+                <td>{_days_left_html(c)}</td>
+                <td>
+                    <span class="{'voice-on' if c['voice_enabled'] else 'voice-off'}">{'📞 On' if c['voice_enabled'] else 'Off'}</span>
+                    <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/voice">
+                        <input type="hidden" name="enabled" value="{'0' if c['voice_enabled'] else '1'}">
+                        <button type="submit" class="small-btn">{'Turn off' if c['voice_enabled'] else 'Turn on'}</button>
+                    </form>
+                </td>
                 <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
                 <td>
                     <a href="/clinic/{c['slug']}/dashboard" target="_blank">Open</a><br>
@@ -196,7 +239,7 @@ def _render_page(message_html: str = "") -> str:
                 </td>
             </tr>"""
     else:
-        rows = "<tr><td colspan=7>No clinics yet -- add the first one below.</td></tr>"
+        rows = "<tr><td colspan=9>No clinics yet -- add the first one below.</td></tr>"
 
     plan_options = "".join(
         f'<option value="{p}">{p.replace("_", " ")}</option>' for p in SUBSCRIPTION_PLAN_CHOICES
@@ -211,8 +254,9 @@ def _render_page(message_html: str = "") -> str:
   {message_html}
 
   <h2>Current clinics</h2>
+  {_renewal_summary_html(clinics)}
   <table>
-    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th><th>Staff dashboard</th><th></th></tr>
+    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Days left before renewal</th><th>Voice calls</th><th>Status</th><th>Staff dashboard</th><th></th></tr>
     {rows}
   </table>
 
@@ -317,6 +361,13 @@ def _render_page(message_html: str = "") -> str:
       </div>
     </div>
 
+    <label class="check-label">
+      <input type="checkbox" name="voice_enabled" value="1">
+      <span>Voice call receptionist (phone calls tier)
+        <span class="hint">Tick if this clinic has subscribed to the AI phone receptionist on top of WhatsApp.
+        Its phone line still needs to be connected to the voice agent (see voice-receptionist notes).</span></span>
+    </label>
+
     <button type="submit">Save and bring this clinic online</button>
   </form>
 </body>
@@ -346,6 +397,7 @@ async def admin_add_clinic(
     dentists: str = Form(""),
     subscription_plan: str = Form("trial"),
     subscription_started_at: str = Form(""),
+    voice_enabled: str = Form(""),
     offers_image: Optional[UploadFile] = File(None),
 ):
     existing = clinics_store.get_clinic_by_phone_number_id(whatsapp_phone_number_id.strip())
@@ -369,6 +421,7 @@ async def admin_add_clinic(
         dentists=_parse_dentists(dentists),
         subscription_plan=subscription_plan,
         subscription_started_at=subscription_started_at or None,
+        voice_enabled=voice_enabled == "1",
     )
 
     # Save the uploaded brochure image (if any) into this clinic's own
@@ -412,6 +465,18 @@ async def admin_add_clinic(
         )
 
     return HTMLResponse(_render_page(message))
+
+
+@router.post("/admin/clinics/{clinic_id}/voice", response_class=HTMLResponse)
+async def admin_set_voice(clinic_id: int, enabled: str = Form("0"), _: bool = Depends(require_admin)):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic:
+        return HTMLResponse(_render_page('<div class="flash-err">No clinic with that id. Nothing changed.</div>'))
+    on = enabled == "1"
+    clinics_store.set_voice_enabled(clinic_id, on)
+    state = "turned ON" if on else "turned OFF"
+    return HTMLResponse(_render_page(
+        f'<div class="flash-ok">📞 Voice call receptionist {state} for {html.escape(clinic["name"])}.</div>'))
 
 
 @router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)

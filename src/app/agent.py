@@ -231,17 +231,21 @@ class ClinicWorker:
                     messages_this_turn = response["messages"][last_human_message_index + 1:]
                     for msg in messages_this_turn:
                         if isinstance(msg, AIMessage):
+                            # A reply can carry text for the patient AND a tool
+                            # call in the same message ("let me check that for
+                            # you" + a slot lookup). The text used to be dropped
+                            # whenever a tool call was present -- never sent,
+                            # and missing from the dashboard transcript.
+                            reply_text = extract_reply_text(msg.content) if msg.content else ""
+                            if reply_text:
+                                db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
+                                self.send(patient_phone_for_reply, reply_text)
                             if msg.tool_calls:
                                 db.add_message(
                                     conversation_id=conversation_id,
                                     sender="agent_tool_call",
                                     message=json.dumps(msg.tool_calls)
                                 )
-                            elif msg.content:
-                                reply_text = extract_reply_text(msg.content)
-                                if reply_text:
-                                    db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
-                                    self.send(patient_phone_for_reply, reply_text)
                         elif isinstance(msg, ToolMessage):
                             tool_data = {"content": msg.content, "tool_call_id": msg.tool_call_id}
                             db.add_message(
