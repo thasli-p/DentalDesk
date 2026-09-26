@@ -81,6 +81,12 @@ class Conversation(BaseModel):
     flag_reason: Optional[str] = Field(
         default=None, description="Why this conversation was flagged -- see flagged_for_staff."
     )
+    channel: str = Field(
+        default="whatsapp", description="'whatsapp' for Sia's chats, 'phone' for voice-receptionist calls."
+    )
+    external_ref: Optional[str] = Field(
+        default=None, description="For phone calls: the voice platform's call/conversation ID (dedupe key)."
+    )
 
 
 # -----------------------

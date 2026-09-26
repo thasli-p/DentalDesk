@@ -320,6 +320,7 @@ def get_dashboard_summary(
                 "patient_age": patient["age"],
                 "patient_gender": patient["gender"],
                 "reason": c["flag_reason"],
+                "channel": c["channel"] if "channel" in c.keys() else "whatsapp",
                 "started_at": c["started_at"],
                 "status": c["status"],
             })
@@ -347,6 +348,7 @@ def get_dashboard_summary(
                 "message_count": list_message_count_by_conv.get(c["id"], 0),
                 "flagged": bool(c["flagged_for_staff"]),
                 "booked": booked,
+                "channel": c["channel"] if "channel" in c.keys() else "whatsapp",
             })
 
         # ---- Most-requested services (only reflects bookings made after

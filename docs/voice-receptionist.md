@@ -39,7 +39,17 @@ URLs use one clinic's slug directly. When real phone lines are connected, the
 slug will come from the number the patient dialled (one shared agent for all
 clinics).
 
+## Calls on the staff dashboard
+ElevenLabs sends every finished call to `POST /voice/post-call` (a workspace
+"post-call webhook"). Mawaid stores it as a 📞 conversation with the full
+transcript, linked to the caller's patient record, so it shows up in "Recent
+conversations" (booked / flagged badges work the same as WhatsApp).
+- Railway variables: `VOICE_WEBHOOK_SECRET` (the webhook's HMAC secret from
+  ElevenLabs) and `VOICE_DEFAULT_CLINIC_SLUG` (which clinic calls belong to
+  during the pilot).
+- `book_appointment` and `flag_for_staff` also receive the call's ID
+  (`system__conversation_id`), so a booking or flag made during a call lands
+  in that same 📞 conversation.
+
 ## Not done yet
-- Calls don't appear in the dashboard's conversation list yet (only their
-  bookings and flags do). Next: ElevenLabs post-call webhook → store transcript.
 - Real phone line (SIP / Saudi number) and using caller ID for `caller_phone`.

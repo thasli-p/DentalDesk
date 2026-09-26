@@ -406,6 +406,16 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
         if "flag_reason" not in existing_columns:
             conn.execute("ALTER TABLE conversations ADD COLUMN flag_reason TEXT")
             logger.info("Migrated conversations table: added flag_reason column.")
+        # Voice receptionist: phone calls are stored as conversations too
+        # (channel='phone'), keyed by the voice platform's own call ID
+        # (external_ref) so a call is never stored twice. Existing rows are
+        # all WhatsApp chats, hence the default.
+        if "channel" not in existing_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN channel TEXT NOT NULL DEFAULT 'whatsapp'")
+            logger.info("Migrated conversations table: added channel column.")
+        if "external_ref" not in existing_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN external_ref TEXT")
+            logger.info("Migrated conversations table: added external_ref column.")
 
         # Same idea for dentists.nationality on databases created before it existed.
         existing_dentist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dentists)")}

@@ -142,7 +142,7 @@ TRANSLATIONS = {
     "col_age": {"en": "Age", "ar": "العمر"},
     "col_gender": {"en": "Gender", "ar": "الجنس"},
     "col_started": {"en": "Started", "ar": "بدأت"},
-    "col_whatsapp": {"en": "WhatsApp", "ar": "واتساب"},
+    "col_whatsapp": {"en": "Mobile", "ar": "الجوال"},
     "col_messages": {"en": "Messages", "ar": "الرسائل"},
     "col_outcome": {"en": "Outcome", "ar": "النتيجة"},
     "search_placeholder": {"en": "Search patient name…", "ar": "ابحث باسم المريض…"},
@@ -183,6 +183,7 @@ TRANSLATIONS = {
     "started_label": {"en": "started", "ar": "بدأت في"},
     "no_messages": {"en": "No messages in this conversation.", "ar": "لا توجد رسائل في هذه المحادثة."},
     "badge_booked": {"en": "booked", "ar": "تم الحجز"},
+    "voice_agent_name": {"en": "AI receptionist (phone)", "ar": "موظف الاستقبال الآلي (هاتف)"},
     "badge_flagged": {"en": "flagged", "ar": "بحاجة لمتابعة"},
     "badge_no_booking": {"en": "no booking", "ar": "بدون حجز"},
     "unknown_patient": {"en": "Unknown", "ar": "غير معروف"},
@@ -648,7 +649,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
                 extra_bits.append(f'{_t("col_gender", lang)} {_fmt_gender(a["patient_gender"], lang)}')
             extra_html = f' · {" · ".join(extra_bits)}' if extra_bits else ""
             items += (
-                f'<div class="attention-item"><b>{html.escape(a["patient_name"] or _t("unknown_patient", lang))}</b> '
+                f'<div class="attention-item">{"📞 " if a.get("channel") == "phone" else ""}<b>{html.escape(a["patient_name"] or _t("unknown_patient", lang))}</b> '
                 f'({html.escape(a["phone_number"] or _t("no_number", lang))}){extra_html} — {_fmt_dt(a["started_at"])} '
                 f'— <a class="view-link" href="{conv_url}">{_t("view_conversation", lang)}</a>'
                 f'<div class="attention-reason">{html.escape(a["reason"] or _t("no_reason_given", lang))}</div></div>'
@@ -672,7 +673,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
             conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{c["conversation_id"]}?days={days_param}{filter_qs}'
             rows += (
                 f'<tr><td>{_fmt_dt(c["started_at"])}</td>'
-                f'<td>{html.escape(c["patient_name"] or _t("unknown_patient", lang))}</td>'
+                f'<td>{"📞 " if c.get("channel") == "phone" else "💬 "}{html.escape(c["patient_name"] or _t("unknown_patient", lang))}</td>'
                 f'<td>{_fmt_age(c["patient_age"])}</td>'
                 f'<td>{_fmt_gender(c["patient_gender"], lang)}</td>'
                 f'<td>{html.escape(c["phone_number"] or "")}</td>'
@@ -842,12 +843,14 @@ def _render_conversation_page(
     # rows are Sia's internal tool calls (booking lookups, etc.), not something
     # a patient saw or a receptionist needs to read to understand the chat.
     visible_messages = [m for m in messages if m.sender in ("user", "agent")]
+    is_phone = getattr(conversation, "channel", "whatsapp") == "phone"
 
     if visible_messages:
         bubbles = ""
         for m in visible_messages:
             side = "patient" if m.sender == "user" else "sia"
-            speaker = (patient.name if patient else "Patient") if side == "patient" else "Sia"
+            agent_name = _t("voice_agent_name", lang) if is_phone else "Sia"
+            speaker = (patient.name if patient else "Patient") if side == "patient" else agent_name
             bubbles += (
                 f'<div class="bubble-row {side}"><div>'
                 f'<div class="bubble">{html.escape(m.message)}</div>'
@@ -871,7 +874,7 @@ def _render_conversation_page(
     <a class="lang-toggle" href="{lang_toggle_url}">{_t('lang_toggle', lang)}</a>
   </div>
   <a class="back-link" href="{back_url}">{'&rarr;' if lang == 'ar' else '&larr;'} {_t('back_to_dashboard', lang)}</a>
-  <h1>💬 {html.escape(patient.name if patient else _t('unknown_patient_title', lang))}</h1>
+  <h1>{'📞' if is_phone else '💬'} {html.escape(patient.name if patient else _t('unknown_patient_title', lang))}</h1>
   <div class="conv-meta">
     {html.escape(patient.phone_number if patient else '')}{age_gender_html} · {_t('started_label', lang)} {_fmt_dt(str(conversation.started_at))}
     · {_t('status_label', lang)}: {html.escape(conversation.status)} · {outcome_badge}

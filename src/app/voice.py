@@ -30,14 +30,17 @@ stores international ones without a plus ("9665XXXXXXXX"). Every number
 coming in here is normalised to the WhatsApp form, so a patient who books
 by phone and later messages on WhatsApp is recognised as the same person.
 """
+import hashlib
 import hmac
+import json
 import logging
+import time
 import os
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from shared import clinics_store, db
@@ -197,6 +200,41 @@ def _patient_owns(appointment_id: int, patient_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _ensure_call_columns() -> None:
+    """The channel/external_ref columns are added by db.init_db when a
+    clinic's worker starts; this makes sure they exist even if a voice
+    request lands on a database that hasn't been migrated yet."""
+    with db.db() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(conversations)")}
+        if "channel" not in cols:
+            conn.execute("ALTER TABLE conversations ADD COLUMN channel TEXT NOT NULL DEFAULT 'whatsapp'")
+        if "external_ref" not in cols:
+            conn.execute("ALTER TABLE conversations ADD COLUMN external_ref TEXT")
+
+
+def _conversation_for_call(call_id: str, patient_id: Optional[int], started_at: Optional[datetime] = None) -> int:
+    """Finds (or creates) the ONE dashboard conversation that represents a
+    phone call, keyed by the voice platform's call ID. Created already
+    'closed' so Sia's WhatsApp worker never mistakes it for an open chat.
+    If the call's patient becomes known later, it is filled in."""
+    _ensure_call_columns()
+    with db.db() as conn:
+        row = conn.execute(
+            "SELECT id, patient_id FROM conversations WHERE channel='phone' AND external_ref=?", (call_id,)
+        ).fetchone()
+        if row:
+            if patient_id and not row["patient_id"]:
+                conn.execute("UPDATE conversations SET patient_id=? WHERE id=?", (patient_id, row["id"]))
+            return row["id"]
+        start = (started_at or datetime.now()).isoformat(timespec="seconds")
+        cur = conn.execute(
+            "INSERT INTO conversations (patient_id, status, started_at, ended_at, closed_reason, channel, external_ref) "
+            "VALUES (?, 'closed', ?, NULL, 'phone_call', 'phone', ?)",
+            (patient_id, start, call_id),
+        )
+        return cur.lastrowid
+
+
 # ---------------------------------------------------------------------------
 # Request bodies (these become the tool parameters in ElevenLabs)
 # ---------------------------------------------------------------------------
@@ -212,10 +250,12 @@ class BookBody(BaseModel):
     dentist_id: int
     appointment_time: str = Field(..., description="ISO 8601, e.g. 2026-09-27T16:00:00")
     service_name: Optional[str] = Field(None, description="Service name exactly as listed in get_clinic_context, if known.")
+    call_id: Optional[str] = Field(None, description="Filled automatically by ElevenLabs (system__conversation_id).")
 
 
 class PhoneBody(BaseModel):
     caller_phone: str
+    call_id: Optional[str] = Field(None, description="Filled automatically by ElevenLabs (system__conversation_id).")
 
 
 class CancelBody(BaseModel):
@@ -233,6 +273,7 @@ class FlagBody(BaseModel):
     caller_phone: str
     reason: str = Field(..., description="Short, specific note for staff, e.g. 'Caller reports facial swelling and fever'.")
     patient_name: Optional[str] = None
+    call_id: Optional[str] = Field(None, description="Filled automatically by ElevenLabs (system__conversation_id).")
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +352,8 @@ async def book(slug: str, body: BookBody, x_voice_key: Optional[str] = Header(No
         service_name=service_name,
         price_sar=price,
     ))
+    if body.call_id:
+        _conversation_for_call(body.call_id, patient.id)
     dentist = db.get_dentist(body.dentist_id)
     logger.info("[%s] Voice booking: appointment %s for patient %s at %s", slug, appt.id, patient.id, when)
     return {
@@ -410,9 +453,137 @@ async def flag_for_staff(slug: str, body: FlagBody, x_voice_key: Optional[str] =
     if not phone:
         return _bad_phone(body.caller_phone)
     patient = _get_or_create_patient(phone, body.patient_name)
-    conversation = db.create_conversation(patient.id)
-    db.add_message(conversation.id, sender="agent", message=f"📞 Phone call — flagged for staff: {body.reason}")
-    db.flag_conversation(conversation.id, f"📞 Phone call: {body.reason}")
-    db.close_conversation(conversation.id, reason="phone_call")
+    if body.call_id:
+        # The full transcript arrives after the call (see post_call below)
+        # and lands in this same conversation.
+        conversation_id = _conversation_for_call(body.call_id, patient.id)
+    else:
+        _ensure_call_columns()
+        with db.db() as conn:
+            conversation_id = conn.execute(
+                "INSERT INTO conversations (patient_id, status, started_at, closed_reason, channel) "
+                "VALUES (?, 'closed', ?, 'phone_call', 'phone')",
+                (patient.id, datetime.now().isoformat(timespec="seconds")),
+            ).lastrowid
+        db.add_message(conversation_id, sender="agent", message=f"📞 Phone call — flagged for staff: {body.reason}")
+    db.flag_conversation(conversation_id, f"📞 {body.reason}")
     logger.warning("[%s] Voice flag for patient %s: %s", slug, patient.id, body.reason)
     return {"status": "flagged"}
+
+
+# ---------------------------------------------------------------------------
+# Post-call webhook: the whole call transcript, sent by ElevenLabs after
+# every call, stored as a 📞 conversation on the clinic's dashboard.
+# ---------------------------------------------------------------------------
+
+def _verify_elevenlabs_signature(raw_body: bytes, header: Optional[str]) -> None:
+    """ElevenLabs signs each webhook as `t=<unix time>,v0=<hex HMAC-SHA256
+    of "<t>.<body>">` using the webhook's shared secret (VOICE_WEBHOOK_SECRET
+    in Railway). Rejects anything unsigned, forged, or older than 30 minutes."""
+    secret = os.environ.get("VOICE_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Voice webhook is not enabled (VOICE_WEBHOOK_SECRET is not set).")
+    if not header:
+        raise HTTPException(status_code=401, detail="Missing signature.")
+    parts = dict(p.split("=", 1) for p in header.split(",") if "=" in p)
+    ts, sig = parts.get("t"), parts.get("v0")
+    if not ts or not sig:
+        raise HTTPException(status_code=401, detail="Malformed signature.")
+    try:
+        if abs(time.time() - int(ts)) > 30 * 60:
+            raise HTTPException(status_code=401, detail="Signature too old.")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Malformed signature timestamp.")
+    expected = hmac.new(secret.encode(), f"{ts}.".encode() + raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=401, detail="Invalid signature.")
+
+
+def _pick_clinic_for_call(data: dict) -> Optional[dict]:
+    """Which clinic a call belongs to: an explicit clinic_slug dynamic
+    variable if the call carried one, else VOICE_DEFAULT_CLINIC_SLUG, else
+    the only active clinic (pilot setups)."""
+    dyn = ((data.get("conversation_initiation_client_data") or {}).get("dynamic_variables") or {})
+    slug = dyn.get("clinic_slug") or os.environ.get("VOICE_DEFAULT_CLINIC_SLUG")
+    if slug:
+        clinic = clinics_store.get_clinic_by_slug(slug)
+        return clinic if clinic and clinic.get("active") else None
+    active = [c for c in clinics_store.list_clinics() if c.get("active")]
+    return active[0] if len(active) == 1 else None
+
+
+def _caller_phone_from_call(data: dict) -> Optional[str]:
+    """Caller ID when the call came in over a real phone line; otherwise
+    the mobile number the caller confirmed, taken from the agent's own tool
+    calls during the call (book / find_appointments / flag)."""
+    phone_call = (data.get("metadata") or {}).get("phone_call") or {}
+    for key in ("external_number", "caller_id", "from_number"):
+        normalized = normalize_saudi_phone(str(phone_call.get(key) or ""))
+        if normalized:
+            return normalized
+    for turn in data.get("transcript") or []:
+        for tc in turn.get("tool_calls") or []:
+            params = tc.get("params_as_json")
+            try:
+                params = json.loads(params) if isinstance(params, str) else (params or {})
+            except ValueError:
+                params = {}
+            normalized = normalize_saudi_phone(str(params.get("caller_phone") or ""))
+            if normalized:
+                return normalized
+    return None
+
+
+@router.post("/post-call")
+async def post_call(request: Request):
+    raw = await request.body()
+    _verify_elevenlabs_signature(raw, request.headers.get("elevenlabs-signature"))
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON.")
+
+    if payload.get("type") != "post_call_transcription":
+        return {"status": "ignored"}  # audio / failure events: nothing to store
+
+    data = payload.get("data") or {}
+    call_id = data.get("conversation_id")
+    clinic = _pick_clinic_for_call(data)
+    if not call_id or not clinic:
+        logger.warning("Post-call webhook for call %s: no matching clinic, not stored.", call_id)
+        return {"status": "ignored", "reason": "no_clinic"}
+    db.set_current_db_path(clinic["db_path"])
+
+    metadata = data.get("metadata") or {}
+    start_ts = metadata.get("start_time_unix_secs")
+    started_at = datetime.fromtimestamp(start_ts) if start_ts else datetime.now()
+    duration = metadata.get("call_duration_secs") or 0
+
+    phone = _caller_phone_from_call(data)
+    patient = _get_or_create_patient(phone, None) if phone else None
+    conversation_id = _conversation_for_call(call_id, patient.id if patient else None, started_at)
+
+    with db.db() as conn:
+        already = conn.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conversation_id,)).fetchone()[0]
+        if already:
+            return {"status": "duplicate", "conversation_id": conversation_id}
+        conn.execute(
+            "UPDATE conversations SET started_at=?, ended_at=?, status='closed', closed_reason='phone_call' WHERE id=?",
+            (started_at.isoformat(timespec="seconds"),
+             (started_at + timedelta(seconds=duration)).isoformat(timespec="seconds"),
+             conversation_id),
+        )
+        rows = []
+        for turn in data.get("transcript") or []:
+            text = (turn.get("message") or "").strip()
+            if not text:
+                continue  # tool-call-only turns
+            sender = "user" if turn.get("role") == "user" else "agent"
+            at = started_at + timedelta(seconds=turn.get("time_in_call_secs") or 0)
+            rows.append((conversation_id, sender, text, at.isoformat(timespec="seconds")))
+        conn.executemany(
+            "INSERT INTO messages (conversation_id, sender, message, created_at) VALUES (?, ?, ?, ?)", rows
+        )
+
+    logger.info("[%s] Stored phone call %s as conversation %s (%d lines)", clinic["slug"], call_id, conversation_id, len(rows))
+    return {"status": "stored", "conversation_id": conversation_id}
