@@ -98,6 +98,24 @@ class ClinicWorker:
 
         builder = StateGraph(State)
 
+        clinic_db_path = self.clinic["db_path"]
+
+        def _upcoming_for(patient_id):
+            """Short list of this patient's upcoming appointments for the prompt.
+            Never lets a lookup problem break the reply."""
+            try:
+                db.set_current_db_path(clinic_db_path)
+                now = datetime.now()
+                return [
+                    f"{a.appointment_time.strftime('%A %Y-%m-%d %H:%M')} with {a.dentist_name}"
+                    + (f" ({a.service_name})" if a.service_name else "")
+                    for a in db.get_patient_appointments(patient_id)
+                    if a.status in ("scheduled", "rescheduled") and a.appointment_time >= now
+                ][:5]
+            except Exception:
+                logger.exception("Could not load upcoming appointments for patient %s", patient_id)
+                return []
+
         def assistant(state: State):
             """The main assistant node that generates responses using the LLM and tools."""
             logger.debug(f"Assistant node invoked with state: {state}")
@@ -111,6 +129,24 @@ class ClinicWorker:
                                  f"Phone Number: {patient.phone_number}\n"
                                  f"Current Conversation ID: {state.get('conversation_id')}\n"
                                  f"---------------------------------")
+                if patient.name and patient.name != "New Patient":
+                    first_name = patient.name.split()[0]
+                    patient_context += (
+                        "\n\nRETURNING PATIENT: this number is already registered to "
+                        f"{patient.name}. In your FIRST reply of this conversation, greet them "
+                        f"warmly by first name so they know you recognised them (e.g. "
+                        f"\"هلا {first_name}، حياك الله من جديد 👋\" — use the feminine/masculine "
+                        "form that matches their gender if known). Do NOT ask again for their "
+                        "name, age or gender — you already have them. If the person writing says "
+                        "they are someone else (e.g. a family member using the same phone), "
+                        "follow what they say and book under that person's name."
+                    )
+                    upcoming = _upcoming_for(patient.id)
+                    if upcoming:
+                        patient_context += (
+                            "\nTheir upcoming appointments (mention only if relevant, e.g. they "
+                            "want to cancel/reschedule or book something clashing): " + "; ".join(upcoming)
+                        )
 
             final_system_prompt = systemPrompt[0].content + patient_context
             sys_msg = SystemMessage(content=final_system_prompt)
