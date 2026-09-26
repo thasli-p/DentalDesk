@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from . import whatsapp as whatsapp
 from . import admin
 from . import dashboard
+from . import voice
 from .clinic_registry import launch_clinic_worker, get_worker_by_phone_number_id
 from shared import clinics_store
 
@@ -56,6 +57,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 app.include_router(admin.router)
 app.include_router(dashboard.router)
+app.include_router(voice.router)
 
 # Serves files from the static/ folder (e.g. the offers/promotions brochure
 # image) at public URLs like <your-app-url>/static/brochure.jpg -- this is
