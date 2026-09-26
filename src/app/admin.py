@@ -176,6 +176,7 @@ PAGE_STYLE = """
   .small-btn:hover { background: #333; }
   .check-label { display: flex; align-items: flex-start; gap: 8px; font-weight: 600; }
   .check-label input { margin-top: 3px; }
+  .voice-number-form input[type=text] { width: 150px; padding: 4px 6px; font-size: 12px; margin-top: 6px; }
 </style>
 """
 
@@ -224,6 +225,10 @@ def _render_page(message_html: str = "") -> str:
                     <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/voice">
                         <input type="hidden" name="enabled" value="{'0' if c['voice_enabled'] else '1'}">
                         <button type="submit" class="small-btn">{'Turn off' if c['voice_enabled'] else 'Turn on'}</button>
+                    </form>
+                    <form class="delete-form voice-number-form" method="post" action="/admin/clinics/{c['id']}/voice-number">
+                        <input type="text" name="voice_number" value="{('+' + html.escape(c['voice_number'])) if c.get('voice_number') else ''}" placeholder="Voice phone number">
+                        <button type="submit" class="small-btn">Save number</button>
                     </form>
                 </td>
                 <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
@@ -368,6 +373,13 @@ def _render_page(message_html: str = "") -> str:
         Its phone line still needs to be connected to the voice agent (see voice-receptionist notes).</span></span>
     </label>
 
+    <label>Voice phone number (optional)
+      <span class="hint">The number patients call to reach this clinic's AI receptionist (the number bought from the
+      SIP provider and added in ElevenLabs), e.g. +966 11 234 5678. Calls to this number are answered with this
+      clinic's dentists, hours and bookings. Can be added later from the clinics table.</span>
+      <input type="text" name="voice_number" placeholder="+966 11 234 5678">
+    </label>
+
     <button type="submit">Save and bring this clinic online</button>
   </form>
 </body>
@@ -398,8 +410,19 @@ async def admin_add_clinic(
     subscription_plan: str = Form("trial"),
     subscription_started_at: str = Form(""),
     voice_enabled: str = Form(""),
+    voice_number: str = Form(""),
     offers_image: Optional[UploadFile] = File(None),
 ):
+    if voice_number.strip():
+        taken = clinics_store.get_clinic_by_voice_number(voice_number)
+        if taken:
+            return HTMLResponse(_render_page(
+                f'<div class="flash-err">Voice number {html.escape(voice_number)} already belongs to '
+                f'{html.escape(taken["name"])}. Nothing was added.</div>'))
+        if not clinics_store.normalize_phone_digits(voice_number):
+            return HTMLResponse(_render_page(
+                f'<div class="flash-err">"{html.escape(voice_number)}" doesn\'t look like a phone number. Nothing was added.</div>'))
+
     existing = clinics_store.get_clinic_by_phone_number_id(whatsapp_phone_number_id.strip())
     if existing:
         message = f'<div class="flash-err">A clinic is already registered with WhatsApp Phone Number ID {html.escape(whatsapp_phone_number_id)} (clinic: {html.escape(existing["name"])}). Nothing was added.</div>'
@@ -423,6 +446,8 @@ async def admin_add_clinic(
         subscription_started_at=subscription_started_at or None,
         voice_enabled=voice_enabled == "1",
     )
+    if voice_number.strip():
+        clinic["voice_number"] = clinics_store.set_voice_number(clinic["id"], voice_number)
 
     # Save the uploaded brochure image (if any) into this clinic's own
     # static folder, then re-write its clinic_config.yaml so the filename
@@ -477,6 +502,27 @@ async def admin_set_voice(clinic_id: int, enabled: str = Form("0"), _: bool = De
     state = "turned ON" if on else "turned OFF"
     return HTMLResponse(_render_page(
         f'<div class="flash-ok">📞 Voice call receptionist {state} for {html.escape(clinic["name"])}.</div>'))
+
+
+@router.post("/admin/clinics/{clinic_id}/voice-number", response_class=HTMLResponse)
+async def admin_set_voice_number(clinic_id: int, voice_number: str = Form(""), _: bool = Depends(require_admin)):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic:
+        return HTMLResponse(_render_page('<div class="flash-err">No clinic with that id. Nothing changed.</div>'))
+    if voice_number.strip() and not clinics_store.normalize_phone_digits(voice_number):
+        return HTMLResponse(_render_page(
+            f'<div class="flash-err">"{html.escape(voice_number)}" doesn\'t look like a phone number. Nothing changed.</div>'))
+    try:
+        saved = clinics_store.set_voice_number(clinic_id, voice_number.strip() or None)
+    except ValueError as e:
+        return HTMLResponse(_render_page(f'<div class="flash-err">{html.escape(str(e))} Nothing changed.</div>'))
+    if saved:
+        msg = f'📞 Calls to +{saved} will now be answered as {html.escape(clinic["name"])}.'
+        if not clinic["voice_enabled"]:
+            msg += ' Note: voice is still turned OFF for this clinic -- turn it on for calls to be answered.'
+    else:
+        msg = f'Voice number removed for {html.escape(clinic["name"])}.'
+    return HTMLResponse(_render_page(f'<div class="flash-ok">{msg}</div>'))
 
 
 @router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)

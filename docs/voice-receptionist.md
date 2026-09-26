@@ -46,10 +46,21 @@ Times are ISO 8601 in Riyadh time, e.g. `2026-09-27T16:00:00`.
 - Flags appear in the staff dashboard's "Needs attention" list, marked 📞.
 
 ## Which clinic a call belongs to
-Each endpoint URL contains the clinic's slug. For the pilot, the agent's tool
-URLs use one clinic's slug directly. When real phone lines are connected, the
-slug will come from the number the patient dialled (one shared agent for all
-clinics).
+One shared ElevenLabs agent serves every clinic. Each tool URL has the number
+the patient DIALLED where the clinic goes:
+`/voice/{called_number}/<tool>`, with the path parameter `called_number` filled
+from the dynamic variable `system__called_number`. Mawaid matches it against
+each clinic's **Voice phone number** (set in `/admin/clinics`). A clinic slug
+also works in that spot. No dialled number (e.g. the web test link) or an
+unregistered number falls back to `VOICE_DEFAULT_CLINIC_SLUG`. The post-call
+log is routed the same way. Voice must also be turned ON for the clinic.
+
+### Adding voice for a new clinic
+1. SIP provider: buy the number, assign it to the existing SIP connection that
+   points to `sip.rtc.elevenlabs.io`.
+2. ElevenLabs: Phone Numbers → Import (SIP trunk) → assign to the shared agent.
+3. `/admin/clinics`: turn Voice on for the clinic and save its voice number.
+4. Optional: the clinic forwards its usual landline to the new number.
 
 ## Calls on the staff dashboard
 ElevenLabs sends every finished call to `POST /voice/post-call` (a workspace

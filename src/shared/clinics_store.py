@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS clinics (
 
     dashboard_password TEXT,
     voice_enabled INTEGER NOT NULL DEFAULT 0,
+    voice_number TEXT,
 
     db_path TEXT NOT NULL,
     config_path TEXT NOT NULL,
@@ -121,6 +122,9 @@ def init_control_db():
             if pilot:
                 conn.execute("UPDATE clinics SET voice_enabled=1 WHERE slug=?", (pilot,))
             logger.info("Migrated clinics table: added voice_enabled column.")
+        if "voice_number" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN voice_number TEXT")
+            logger.info("Migrated clinics table: added voice_number column.")
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -162,6 +166,43 @@ def subscription_days_left(clinic: Dict[str, Any]) -> Optional[int]:
     if not ends:
         return None
     return (ends.date() - datetime.now().date()).days
+
+
+def normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
+    """Any way a phone number gets written (+966 11 234 5678, 00966..., 011...,
+    +1-641-461-0793) -> international digits only (966112345678, 16414610793),
+    so the number typed in the admin page matches the number a call arrives on."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) in (9, 10):  # Saudi local: 05XXXXXXXX / 011XXXXXXX
+        digits = "966" + digits[1:]
+    return digits if len(digits) >= 8 else None
+
+
+def set_voice_number(clinic_id: int, number: Optional[str]) -> Optional[str]:
+    """Saves the phone number patients call for this clinic's AI receptionist.
+    Returns the normalized number (None clears it). Raises ValueError if
+    another clinic already uses it."""
+    normalized = normalize_phone_digits(number) if number else None
+    with _db() as conn:
+        if normalized:
+            other = conn.execute(
+                "SELECT name FROM clinics WHERE voice_number=? AND id<>?", (normalized, clinic_id)
+            ).fetchone()
+            if other:
+                raise ValueError(f"+{normalized} is already the voice number of {other['name']}.")
+        conn.execute("UPDATE clinics SET voice_number=? WHERE id=?", (normalized, clinic_id))
+    return normalized
+
+
+def get_clinic_by_voice_number(number: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = normalize_phone_digits(number)
+    if not normalized:
+        return None
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM clinics WHERE voice_number=?", (normalized,)).fetchone()
+        return _row_to_dict(row) if row else None
 
 
 def set_voice_enabled(clinic_id: int, enabled: bool):

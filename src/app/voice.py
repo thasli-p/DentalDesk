@@ -65,10 +65,30 @@ def _check_key(x_voice_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Voice-Key header.")
 
 
+def resolve_clinic(key: Optional[str]) -> Optional[dict]:
+    """Which clinic a voice request is for. `key` is what sits in the URL
+    where the clinic goes: normally the number the patient DIALLED (the
+    ElevenLabs tools fill it from system__called_number), so one shared agent
+    serves every clinic -- each clinic's voice number is set in /admin/clinics.
+    A clinic slug also works. When there is no dialled number (e.g. the
+    ElevenLabs web test link) or it isn't registered to any clinic, the pilot
+    clinic in VOICE_DEFAULT_CLINIC_SLUG is used."""
+    key = (key or "").strip()
+    clinic = None
+    if key and not key.startswith("{"):
+        clinic = clinics_store.get_clinic_by_slug(key) or clinics_store.get_clinic_by_voice_number(key)
+        if not clinic and clinics_store.normalize_phone_digits(key):
+            logger.warning("Voice request for number %s, which no clinic has as its voice number.", key)
+    if not clinic:
+        default = os.environ.get("VOICE_DEFAULT_CLINIC_SLUG")
+        clinic = clinics_store.get_clinic_by_slug(default) if default else None
+    return clinic
+
+
 def _load_clinic(slug: str) -> dict:
-    """Finds the clinic by slug and points shared/db.py at its own database
-    for the rest of this request (same pattern as the staff dashboard)."""
-    clinic = clinics_store.get_clinic_by_slug(slug)
+    """Finds the clinic (by dialled number or slug, see resolve_clinic) and
+    points shared/db.py at its own database for the rest of this request."""
+    clinic = resolve_clinic(slug)
     if not clinic or not clinic.get("active"):
         raise HTTPException(status_code=404, detail="Clinic not found or inactive.")
     if not clinic.get("voice_enabled"):
@@ -775,9 +795,12 @@ def _pick_clinic_for_call(data: dict) -> Optional[dict]:
     variable if the call carried one, else VOICE_DEFAULT_CLINIC_SLUG, else
     the only active clinic (pilot setups)."""
     dyn = ((data.get("conversation_initiation_client_data") or {}).get("dynamic_variables") or {})
-    slug = dyn.get("clinic_slug") or os.environ.get("VOICE_DEFAULT_CLINIC_SLUG")
-    if slug:
-        clinic = clinics_store.get_clinic_by_slug(slug)
+    phone_call = (data.get("metadata") or {}).get("phone_call") or {}
+    dialled = (dyn.get("system__called_number") or phone_call.get("agent_number")
+               or phone_call.get("called_number") or phone_call.get("to_number"))
+    key = dyn.get("clinic_slug") or dialled
+    if key or os.environ.get("VOICE_DEFAULT_CLINIC_SLUG"):
+        clinic = resolve_clinic(key)
         return clinic if clinic and clinic.get("active") and clinic.get("voice_enabled") else None
     active = [c for c in clinics_store.list_clinics() if c.get("active") and c.get("voice_enabled")]
     return active[0] if len(active) == 1 else None
