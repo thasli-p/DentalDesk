@@ -138,17 +138,125 @@ def _is_holiday(clinic: dict, dt: datetime) -> bool:
     return dt.strftime("%Y-%m-%d") in set(clinic.get("holidays") or [])
 
 
-def _booked_times(dentist_id: int, day: datetime) -> List[str]:
-    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    with db.db() as conn:
-        rows = conn.execute(
-            "SELECT appointment_time FROM appointments "
-            "WHERE dentist_id=? AND status IN ('scheduled','rescheduled') "
-            "AND appointment_time >= ? AND appointment_time < ? ORDER BY appointment_time",
-            (dentist_id, start.isoformat(), end.isoformat()),
-        ).fetchall()
-    return [r["appointment_time"] for r in rows]
+# --- Working-hours parsing --------------------------------------------------
+# Dentist schedules and clinic hours are free text typed by the clinic in the
+# admin page ("Mon-Fri 10:00-17:00", "Saturday-Thursday 9:00 AM - 9:00 PM,
+# Friday closed", "السبت-الخميس 4م-10م" ...). The AI used to read these itself
+# and sometimes got the days wrong, so the server now works them out and
+# refuses bookings outside them. Unreadable text -> no check (never blocks).
+
+_DAY_WORDS = {
+    # Python weekday(): Mon=0 ... Sun=6
+    "mon": 0, "monday": 0, "الاثنين": 0, "الإثنين": 0, "اثنين": 0,
+    "tue": 1, "tues": 1, "tuesday": 1, "الثلاثاء": 1, "ثلاثاء": 1,
+    "wed": 2, "wednesday": 2, "الأربعاء": 2, "الاربعاء": 2, "اربعاء": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "الخميس": 3, "خميس": 3,
+    "fri": 4, "friday": 4, "الجمعة": 4, "الجمعه": 4, "جمعة": 4,
+    "sat": 5, "saturday": 5, "السبت": 5, "سبت": 5,
+    "sun": 6, "sunday": 6, "الأحد": 6, "الاحد": 6, "أحد": 6,
+}
+_DAY_RE = "|".join(sorted((re.escape(w) for w in _DAY_WORDS), key=len, reverse=True))
+_TIME_RE = r"(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.|ص|م|صباحا|صباحًا|مساء|مساءً)?"
+_DASH = r"\s*(?:-|–|—|to|الى|إلى|حتى)\s*"
+
+
+def _to_minutes(h: str, m: Optional[str], ampm: Optional[str], default_pm: bool = False) -> int:
+    hour, minute = int(h), int(m or 0)
+    tag = (ampm or "").lower().replace(".", "")
+    if tag in ("pm", "م", "مساء", "مساءً") and hour < 12:
+        hour += 12
+    elif tag in ("am", "ص", "صباحا", "صباحًا") and hour == 12:
+        hour = 0
+    elif not tag and default_pm and hour < 12:
+        hour += 12
+    return hour * 60 + minute
+
+
+def _expand_days(a: int, b: Optional[int]) -> List[int]:
+    if b is None:
+        return [a]
+    days, d = [a], a
+    while d != b:  # wraps around the week, so "Sat-Thu" works
+        d = (d + 1) % 7
+        days.append(d)
+    return days
+
+
+def parse_schedule(text: Optional[str]) -> Optional[Dict[int, tuple]]:
+    """'Mon-Fri 10:00-17:00, Sat 10:00-13:00' -> {0: (600, 1020), ..., 5: (600, 780)}
+    (minutes after midnight). Returns None when nothing readable is found."""
+    if not text:
+        return None
+    result: Dict[int, tuple] = {}
+    closed: set = set()
+    pending: List[int] = []  # days listed without hours yet, e.g. "Sun, Tue, Thu 9-5"
+    for part in re.split(r"[,;\n،|/]+", text.lower()):
+        day_hits = list(re.finditer(rf"({_DAY_RE})(?:{_DASH}({_DAY_RE}))?", part))
+        if not day_hits:
+            continue
+        days: List[int] = []
+        for hit in day_hits:
+            days += _expand_days(_DAY_WORDS[hit.group(1)], _DAY_WORDS[hit.group(2)] if hit.group(2) else None)
+        if re.search(r"closed|off|مغلق|إجازة|اجازة", part):
+            closed.update(days)
+            pending = []
+            continue
+        times = re.search(rf"{_TIME_RE}{_DASH}{_TIME_RE}", part[day_hits[-1].end():])
+        if not times:
+            pending += days
+            continue
+        days = pending + days
+        pending = []
+        g = times.groups()
+        start = _to_minutes(g[0], g[1], g[2] or (g[5] if g[5] and int(g[0]) <= int(g[3]) else None))
+        end = _to_minutes(g[3], g[4], g[5], default_pm=int(g[3]) < int(g[0]) and not g[5])
+        if end <= start:
+            continue
+        for d in days:
+            result[d] = (start, end)
+    for d in closed:
+        result.pop(d, None)
+    return result or None
+
+
+def _fmt_minutes(mins: int) -> str:
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def describe_schedule(sched: Optional[Dict[int, tuple]]) -> Optional[List[str]]:
+    """Plain list for the agent, e.g. ['السبت 10:00-16:00', 'الاثنين 10:00-16:00']
+    in Saudi week order (Sat first)."""
+    if not sched:
+        return None
+    order = [5, 6, 0, 1, 2, 3, 4]
+    return [f"{WEEKDAY_NAMES_AR[d]} {_fmt_minutes(sched[d][0])}-{_fmt_minutes(sched[d][1])}" for d in order if d in sched]
+
+
+def effective_schedule(clinic: dict, dentist) -> Optional[Dict[int, tuple]]:
+    """The dentist's hours trimmed to when the clinic is actually open."""
+    own = parse_schedule(dentist.availability_schedule)
+    general = parse_schedule(clinic.get("general_hours"))
+    if not own:
+        return general
+    if not general:
+        return own
+    out = {}
+    for d, (s1, e1) in own.items():
+        if d in general:
+            s2, e2 = general[d]
+            if max(s1, s2) < min(e1, e2):
+                out[d] = (max(s1, s2), min(e1, e2))
+    return out or None
+
+
+def _outside_hours(sched: Optional[Dict[int, tuple]], when: datetime) -> bool:
+    if not sched:
+        return False  # unknown schedule: don't block
+    hours = sched.get(when.weekday())
+    if not hours:
+        return True
+    mins = when.hour * 60 + when.minute
+    return not (hours[0] <= mins < hours[1])
 
 
 def _slot_taken(dentist_id: int, when: datetime, exclude_id: Optional[int] = None) -> bool:
@@ -162,40 +270,146 @@ def _slot_taken(dentist_id: int, when: datetime, exclude_id: Optional[int] = Non
         return conn.execute(sql, params).fetchone() is not None
 
 
-def _check_bookable(clinic: dict, dentist_id: int, when: datetime) -> Optional[Dict[str, Any]]:
-    """Shared checks for booking/rescheduling. Returns an error dict, or None if fine."""
-    if not db.get_dentist(dentist_id):
-        return {"error": "dentist_not_found", "details": "Unknown dentist_id. Call get_clinic_context for the list."}
+def _problem_at(clinic: dict, dentist, when: datetime, exclude_id: Optional[int] = None) -> Optional[str]:
+    """Why this dentist can't take this time (error code), or None if free."""
     if when < datetime.now():
-        return {"error": "time_in_past", "details": "That time has already passed. Offer a future time."}
-    if _is_holiday(clinic, when):
-        return {"error": "clinic_closed", "details": f"The clinic is closed on {_day_label(when)} (holiday)."}
-    if _slot_taken(dentist_id, when):
-        return {
-            "error": "slot_unavailable",
-            "details": "That time is already booked for this dentist.",
-            "booked_times_that_day": _booked_times(dentist_id, when),
-        }
+        return "time_in_past"
+    if _is_holiday(clinic, when) or _outside_hours(parse_schedule(clinic.get("general_hours")), when):
+        return "clinic_closed"
+    if _outside_hours(parse_schedule(dentist.availability_schedule), when):
+        return "dentist_not_working"
+    if _slot_taken(dentist.id, when, exclude_id):
+        return "slot_unavailable"
     return None
 
 
-def _get_or_create_patient(phone: str, name: Optional[str]) -> Patient:
-    patient = db.get_patient_by_phone(phone)
-    if patient:
-        # A WhatsApp-only contact may still be the placeholder "New Patient";
-        # fill in the real name now that the caller has given it.
-        if name and patient.name in ("", "New Patient"):
-            with db.db() as conn:
-                conn.execute("UPDATE patients SET name=? WHERE id=?", (name, patient.id))
-            patient.name = name
-        return patient
-    return db.create_patient(Patient(name=name or "New Patient", phone_number=phone))
+def _next_free_times(clinic: dict, dentist, after: datetime, count: int = 3,
+                     exclude_id: Optional[int] = None) -> List[str]:
+    """The next few free half-hour slots for this dentist from `after`
+    onwards (within 14 days), so the agent can offer real alternatives
+    instead of guessing."""
+    start = max(after, datetime.now())
+    t = start.replace(second=0, microsecond=0)
+    t += timedelta(minutes=(30 - t.minute % 30) % 30)
+    found: List[str] = []
+    limit = start + timedelta(days=14)
+    while t < limit and len(found) < count:
+        if not _problem_at(clinic, dentist, t, exclude_id):
+            found.append(t.isoformat(timespec="minutes"))
+        t += timedelta(minutes=30)
+    return found
 
 
-def _patient_owns(appointment_id: int, patient_id: int) -> Optional[dict]:
+_PROBLEM_TEXT = {
+    "time_in_past": "That time has already passed.",
+    "clinic_closed": "The clinic is closed at that time.",
+    "dentist_not_working": "This dentist does not work at that day/time.",
+    "slot_unavailable": "That time is already booked for this dentist.",
+}
+
+
+def _check_bookable(clinic: dict, dentist_id: int, when: datetime,
+                    exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Shared checks for booking/rescheduling. Returns an error dict (with
+    real alternative times), or None if fine."""
+    dentist = db.get_dentist(dentist_id)
+    if not dentist:
+        return {"error": "dentist_not_found", "details": "Unknown dentist_id. Call get_clinic_context for the list."}
+    problem = _problem_at(clinic, dentist, when, exclude_id)
+    if not problem:
+        return None
+    return {
+        "error": problem,
+        "details": _PROBLEM_TEXT[problem] + " Offer the caller one of next_free_times instead.",
+        "dentist_works": describe_schedule(effective_schedule(clinic, dentist)),
+        "next_free_times": _next_free_times(clinic, dentist, when, exclude_id=exclude_id),
+    }
+
+
+def _free_dentists_at(clinic: dict, when: datetime) -> List[Dict[str, Any]]:
+    return [
+        {"dentist_id": d.id, "name": d.name, "specialization": d.specialization}
+        for d in db.get_all_dentists()
+        if not _problem_at(clinic, d, when)
+    ]
+
+
+PLACEHOLDER_NAMES = ("", "New Patient")
+
+
+def _norm_gender(value: Optional[str]) -> Optional[str]:
+    v = (value or "").strip().lower()
+    if v in ("male", "m", "man", "ذكر", "رجل"):
+        return "Male"
+    if v in ("female", "f", "woman", "أنثى", "انثى", "امرأة"):
+        return "Female"
+    return None
+
+
+def _norm_name(name: str) -> str:
+    name = re.sub(r"[ً-ْـ]", "", name or "")  # Arabic diacritics / tatweel
+    name = name.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+    return re.sub(r"\s+", " ", name).strip().lower()
+
+
+def _same_person(a: str, b: str) -> bool:
+    """Loose match so 'كارين' and 'كارين أحمد' (or a re-spelled name) count
+    as the same person, while 'زياد' and 'كارين' don't."""
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return False
+    return na == nb or na.split()[0] == nb.split()[0]
+
+
+def _patients_for_phone(phone: str) -> List[Patient]:
+    """Everyone registered under this mobile number. One phone is often
+    shared by a family (a wife booking from her husband's phone), so each
+    person keeps their own patient record under the same number."""
+    with db.db() as conn:
+        rows = conn.execute("SELECT * FROM patients WHERE phone_number=? ORDER BY id", (phone,)).fetchall()
+    return [Patient(**dict(r)) for r in rows]
+
+
+def _get_or_create_patient(phone: str, name: Optional[str], gender: Optional[str] = None) -> Patient:
+    """The patient record for this caller. Matches by name among the people
+    on this number; a new name on a known number becomes a new family
+    member rather than overwriting (or booking under) someone else."""
+    gender = _norm_gender(gender)
+    people = _patients_for_phone(phone)
+    chosen: Optional[Patient] = None
+    if not name:
+        chosen = people[0] if people else None
+    else:
+        chosen = next((p for p in people if _same_person(p.name, name)), None)
+        if not chosen:
+            # A WhatsApp-only contact may still be the placeholder "New
+            # Patient"; that record becomes this caller.
+            chosen = next((p for p in people if p.name in PLACEHOLDER_NAMES), None)
+    if not chosen:
+        return db.create_patient(Patient(name=name or "New Patient", phone_number=phone, gender=gender))
+
+    updates = {}
+    if name and chosen.name in PLACEHOLDER_NAMES:
+        updates["name"] = name
+    if gender and chosen.gender != gender:
+        updates["gender"] = gender
+    if updates:
+        with db.db() as conn:
+            conn.execute(
+                f"UPDATE patients SET {', '.join(k + '=?' for k in updates)} WHERE id=?",
+                (*updates.values(), chosen.id),
+            )
+        for k, v in updates.items():
+            setattr(chosen, k, v)
+    return chosen
+
+
+def _phone_owns(appointment_id: int, phone: str) -> Optional[dict]:
+    """The appointment, if it belongs to anyone registered on this number."""
     with db.db() as conn:
         row = conn.execute(
-            "SELECT * FROM appointments WHERE id=? AND patient_id=?", (appointment_id, patient_id)
+            "SELECT a.* FROM appointments a JOIN patients p ON a.patient_id = p.id "
+            "WHERE a.id=? AND p.phone_number=?", (appointment_id, phone)
         ).fetchone()
     return dict(row) if row else None
 
@@ -240,13 +454,14 @@ def _conversation_for_call(call_id: str, patient_id: Optional[int], started_at: 
 # ---------------------------------------------------------------------------
 
 class CheckSlotBody(BaseModel):
-    dentist_id: int = Field(..., description="Dentist ID from get_clinic_context.")
+    dentist_id: Optional[int] = Field(None, description="Dentist ID from get_clinic_context. Leave empty when the caller has no preference: the reply then lists every dentist free at that time.")
     appointment_time: str = Field(..., description="Requested time, ISO 8601, e.g. 2026-09-27T16:00:00")
 
 
 class BookBody(BaseModel):
     caller_phone: str = Field(..., description="Caller's mobile number, 10 digits starting 05 (or caller ID).")
-    patient_name: str = Field(..., description="Caller's full name.")
+    patient_name: str = Field(..., description="Name of the person the appointment is for.")
+    patient_gender: Optional[str] = Field(None, description="'male' or 'female' if clear from the conversation, else empty.")
     dentist_id: int
     appointment_time: str = Field(..., description="ISO 8601, e.g. 2026-09-27T16:00:00")
     service_name: Optional[str] = Field(None, description="Service name exactly as listed in get_clinic_context, if known.")
@@ -281,10 +496,12 @@ class FlagBody(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("/{slug}/context")
-async def get_clinic_context(slug: str, x_voice_key: Optional[str] = Header(None)):
+async def get_clinic_context(slug: str, caller_phone: Optional[str] = None,
+                             x_voice_key: Optional[str] = Header(None)):
     """Everything the agent needs at the start of a call: today's date/time,
-    clinic hours, address, services & prices, holidays, and the dentists
-    (with the IDs the booking tools need)."""
+    clinic hours, address, services & prices, holidays, the dentists (with
+    the IDs the booking tools need and the days they work), and -- when the
+    call comes from a known number -- who is registered on it."""
     _check_key(x_voice_key)
     clinic = _load_clinic(slug)
     now = datetime.now()
@@ -295,11 +512,11 @@ async def get_clinic_context(slug: str, x_voice_key: Optional[str] = Header(None
             "name": d.name,
             "specialization": d.specialization,
             "languages": d.languages_spoken,
-            "availability": d.availability_schedule,
+            "works": describe_schedule(effective_schedule(clinic, d)) or d.availability_schedule,
         }
         for d in db.get_all_dentists()
     ]
-    return {
+    result = {
         "now": now.isoformat(timespec="minutes"),
         "today": _day_label(now),
         "clinic_name": clinic["name"],
@@ -309,23 +526,76 @@ async def get_clinic_context(slug: str, x_voice_key: Optional[str] = Header(None
         "upcoming_holidays": upcoming_holidays,
         "services": clinic.get("services") or [],
         "dentists": dentists,
+        "caller": _caller_summary(caller_phone, now),
+    }
+    return result
+
+
+def _caller_summary(caller_phone: Optional[str], now: datetime) -> Dict[str, Any]:
+    """What Mawaid already knows about the number that is calling."""
+    phone = normalize_saudi_phone(caller_phone or "")
+    if not phone:
+        return {"known": False, "phone": None,
+                "note": "No usable caller ID. Ask for the caller's mobile number when needed."}
+    people = [p for p in _patients_for_phone(phone) if p.name not in PLACEHOLDER_NAMES]
+    if not people:
+        return {"known": False, "phone": _local_phone(phone),
+                "note": "New number, not registered yet. You may book on this number after confirming with the caller."}
+    with db.db() as conn:
+        rows = conn.execute(
+            "SELECT a.id, a.appointment_time, p.name AS patient, d.name AS dentist, a.service_name "
+            "FROM appointments a JOIN patients p ON a.patient_id=p.id JOIN dentists d ON a.dentist_id=d.id "
+            "WHERE p.phone_number=? AND a.status IN ('scheduled','rescheduled') AND a.appointment_time>=? "
+            "ORDER BY a.appointment_time",
+            (phone, now.isoformat()),
+        ).fetchall()
+    return {
+        "known": True,
+        "phone": _local_phone(phone),
+        "people_on_this_number": [{"name": p.name, "gender": (p.gender or "unknown").lower()} for p in people],
+        "upcoming_appointments": [
+            {"appointment_id": r["id"], "for": r["patient"],
+             "day": _day_label(datetime.fromisoformat(r["appointment_time"])),
+             "time": datetime.fromisoformat(r["appointment_time"]).strftime("%H:%M"),
+             "dentist": r["dentist"], "service": r["service_name"]}
+            for r in rows
+        ],
+        "note": "Several family members may share one phone. Don't assume who is calling: "
+                "confirm the name before booking or discussing an appointment.",
     }
 
 
 @router.post("/{slug}/check-slot")
 async def check_slot(slug: str, body: CheckSlotBody, x_voice_key: Optional[str] = Header(None)):
-    """Is this dentist free at this time? Also returns what's already booked
-    that day so the agent can offer a nearby free time straight away."""
+    """Is this dentist free at this time? If not, returns the real reason
+    and the next free times. Without a dentist_id, lists every dentist free
+    at that time (for callers who don't mind which dentist)."""
     _check_key(x_voice_key)
     clinic = _load_clinic(slug)
     when = _parse_time(body.appointment_time)
     if not when:
         return {"error": "bad_time_format", "details": "Use ISO 8601, e.g. 2026-09-27T16:00:00"}
+    if not body.dentist_id:
+        free = _free_dentists_at(clinic, when)
+        if free:
+            return {"available": True, "day": _day_label(when), "time": when.strftime("%H:%M"),
+                    "free_dentists": free,
+                    "details": "Pick the first one that suits the service unless the caller asks otherwise."}
+        # Nobody free: suggest the soonest times per dentist.
+        options = []
+        for d in db.get_all_dentists():
+            times = _next_free_times(clinic, d, when, count=2)
+            if times:
+                options.append({"dentist_id": d.id, "name": d.name, "next_free_times": times})
+        options.sort(key=lambda o: o["next_free_times"][0])
+        return {"available": False, "error": "no_dentist_free",
+                "details": "No dentist is free at that time. Offer the earliest of these.",
+                "alternatives": options[:3]}
     problem = _check_bookable(clinic, body.dentist_id, when)
     if problem:
         problem["available"] = False
         return problem
-    return {"available": True, "day": _day_label(when), "booked_times_that_day": _booked_times(body.dentist_id, when)}
+    return {"available": True, "day": _day_label(when), "time": when.strftime("%H:%M")}
 
 
 @router.post("/{slug}/book")
@@ -342,7 +612,7 @@ async def book(slug: str, body: BookBody, x_voice_key: Optional[str] = Header(No
     if problem:
         return problem
 
-    patient = _get_or_create_patient(phone, body.patient_name)
+    patient = _get_or_create_patient(phone, body.patient_name, body.patient_gender)
     service_name, price = _match_service(clinic, body.service_name)
     appt = db.create_appointment(Appointment(
         patient_id=patient.id,
@@ -376,22 +646,26 @@ async def find_appointments(slug: str, body: PhoneBody, x_voice_key: Optional[st
     phone = normalize_saudi_phone(body.caller_phone)
     if not phone:
         return _bad_phone(body.caller_phone)
-    patient = db.get_patient_by_phone(phone)
-    if not patient:
+    people = _patients_for_phone(phone)
+    if not people:
         return {"appointments": [], "details": "No patient found with this number."}
     now = datetime.now()
-    upcoming = [
-        {
-            "appointment_id": a.appointment_id,
-            "day": _day_label(a.appointment_time),
-            "time": a.appointment_time.strftime("%H:%M"),
-            "dentist": a.dentist_name,
-            "service": a.service_name,
-        }
-        for a in db.get_patient_appointments(patient.id)
-        if a.status in ("scheduled", "rescheduled") and a.appointment_time >= now
-    ]
-    return {"patient_name": patient.name, "appointments": upcoming}
+    upcoming = []
+    for person in people:
+        for a in db.get_patient_appointments(person.id):
+            if a.status in ("scheduled", "rescheduled") and a.appointment_time >= now:
+                upcoming.append({
+                    "appointment_id": a.appointment_id,
+                    "for": person.name,
+                    "day": _day_label(a.appointment_time),
+                    "time": a.appointment_time.strftime("%H:%M"),
+                    "dentist": a.dentist_name,
+                    "service": a.service_name,
+                    "_sort": a.appointment_time,
+                })
+    upcoming.sort(key=lambda x: x.pop("_sort"))
+    return {"people_on_this_number": [p.name for p in people if p.name not in PLACEHOLDER_NAMES],
+            "appointments": upcoming}
 
 
 @router.post("/{slug}/cancel")
@@ -401,9 +675,8 @@ async def cancel(slug: str, body: CancelBody, x_voice_key: Optional[str] = Heade
     phone = normalize_saudi_phone(body.caller_phone)
     if not phone:
         return _bad_phone(body.caller_phone)
-    patient = db.get_patient_by_phone(phone)
     # Only let a caller cancel an appointment that belongs to their own number.
-    appt = _patient_owns(body.appointment_id, patient.id) if patient else None
+    appt = _phone_owns(body.appointment_id, phone)
     if not appt or appt["status"] not in ("scheduled", "rescheduled"):
         return {"error": "not_found", "details": "No active appointment with that ID for this caller's number."}
     db.update_appointment_status(body.appointment_id, "cancelled")
@@ -421,18 +694,13 @@ async def reschedule(slug: str, body: RescheduleBody, x_voice_key: Optional[str]
     when = _parse_time(body.new_appointment_time)
     if not when:
         return {"error": "bad_time_format", "details": "Use ISO 8601, e.g. 2026-09-27T16:00:00"}
-    patient = db.get_patient_by_phone(phone)
-    appt = _patient_owns(body.appointment_id, patient.id) if patient else None
+    appt = _phone_owns(body.appointment_id, phone)
     if not appt or appt["status"] not in ("scheduled", "rescheduled"):
         return {"error": "not_found", "details": "No active appointment with that ID for this caller's number."}
 
-    dentist_id = appt["dentist_id"]
-    if when < datetime.now():
-        return {"error": "time_in_past", "details": "That time has already passed. Offer a future time."}
-    if _is_holiday(clinic, when):
-        return {"error": "clinic_closed", "details": f"The clinic is closed on {_day_label(when)} (holiday)."}
-    if _slot_taken(dentist_id, when, exclude_id=body.appointment_id):
-        return {"error": "slot_unavailable", "booked_times_that_day": _booked_times(dentist_id, when)}
+    problem = _check_bookable(clinic, appt["dentist_id"], when, exclude_id=body.appointment_id)
+    if problem:
+        return problem
 
     with db.db() as conn:
         conn.execute(
@@ -534,6 +802,21 @@ def _caller_phone_from_call(data: dict) -> Optional[str]:
     return None
 
 
+def _patient_name_from_call(data: dict) -> Optional[str]:
+    """The name the agent booked or flagged under during the call, so a
+    call from a shared family phone lands on the right person."""
+    for turn in data.get("transcript") or []:
+        for tc in turn.get("tool_calls") or []:
+            params = tc.get("params_as_json")
+            try:
+                params = json.loads(params) if isinstance(params, str) else (params or {})
+            except ValueError:
+                params = {}
+            if params.get("patient_name"):
+                return str(params["patient_name"])
+    return None
+
+
 @router.post("/post-call")
 async def post_call(request: Request):
     raw = await request.body()
@@ -560,7 +843,7 @@ async def post_call(request: Request):
     duration = metadata.get("call_duration_secs") or 0
 
     phone = _caller_phone_from_call(data)
-    patient = _get_or_create_patient(phone, None) if phone else None
+    patient = _get_or_create_patient(phone, _patient_name_from_call(data)) if phone else None
     conversation_id = _conversation_for_call(call_id, patient.id if patient else None, started_at)
 
     with db.db() as conn:

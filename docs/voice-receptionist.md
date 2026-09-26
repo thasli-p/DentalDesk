@@ -14,9 +14,9 @@ Every request needs the header `X-Voice-Key: <VOICE_API_KEY>`.
 
 | Tool name (ElevenLabs) | Method + path | Body (JSON) |
 |---|---|---|
-| get_clinic_context | GET `/context` | — |
-| check_slot | POST `/check-slot` | `dentist_id`, `appointment_time` |
-| book_appointment | POST `/book` | `caller_phone`, `patient_name`, `dentist_id`, `appointment_time`, `service_name` (optional) |
+| get_clinic_context | GET `/context?caller_phone=<caller ID>` | — |
+| check_slot | POST `/check-slot` | `appointment_time`, `dentist_id` (optional: empty = any free dentist) |
+| book_appointment | POST `/book` | `caller_phone`, `patient_name`, `dentist_id`, `appointment_time`, `service_name`, `patient_gender`, `call_id` (last three optional) |
 | find_appointments | POST `/appointments` | `caller_phone` |
 | cancel_appointment | POST `/cancel` | `caller_phone`, `appointment_id` |
 | reschedule_appointment | POST `/reschedule` | `caller_phone`, `appointment_id`, `new_appointment_time` |
@@ -29,7 +29,19 @@ Times are ISO 8601 in Riyadh time, e.g. `2026-09-27T16:00:00`.
   booking and a WhatsApp chat from the same person share one patient record.
   Anything that isn't a valid 10-digit `05…` number is rejected with
   `invalid_phone` so the agent asks again.
-- No booking in the past, on a clinic holiday, or in a slot already taken.
+- No booking in the past, on a clinic holiday, outside the clinic's hours,
+  outside the dentist's own working days/hours, or in a slot already taken.
+  Hours are read from the free text in the admin page ("Mon-Fri 10:00-17:00",
+  "Saturday-Thursday 9:00 AM - 9:00 PM, Friday closed", "السبت-الخميس 4م-10م").
+  Text the server can't read is not enforced. When a time doesn't work, the
+  reply includes the real reason and the next free times to offer.
+- One phone can belong to a whole family: each person gets their own patient
+  record under the same number (matched by name), so a wife booking from her
+  husband's phone is booked under her own name. Anyone on the number can see,
+  cancel or reschedule that number's appointments.
+- `get_clinic_context` receives the caller ID and returns who is registered on
+  that number (name + male/female) and their upcoming appointments, so the
+  agent can greet returning callers properly (after confirming who is speaking).
 - A caller can only see, cancel or reschedule appointments under their own number.
 - Flags appear in the staff dashboard's "Needs attention" list, marked 📞.
 
@@ -51,5 +63,9 @@ conversations" (booked / flagged badges work the same as WhatsApp).
   (`system__conversation_id`), so a booking or flag made during a call lands
   in that same 📞 conversation.
 
+## Phone line
+Pilot: Telnyx US number +1 641 461 0793 → SIP trunk → ElevenLabs (caller ID
+arrives as `system__caller_id`). A Saudi number needs the CR first.
+
 ## Not done yet
-- Real phone line (SIP / Saudi number) and using caller ID for `caller_phone`.
+- Routing by dialled number (called number → clinic slug) for several clinics.
