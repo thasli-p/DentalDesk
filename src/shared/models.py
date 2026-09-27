@@ -15,6 +15,12 @@ class Dentist(BaseModel):
     years_experience: Optional[int] = None
     availability_schedule: Optional[str] = None
     nationality: Optional[str] = None
+    department: Optional[str] = Field(
+        default=None,
+        description="Which department this practitioner works in (key or name, see shared/clinic_types.py). "
+                    "Blank = the clinic's main department -- every practitioner of a plain dental clinic.",
+    )
+    gender: Optional[str] = Field(default=None, description="Male/Female -- lets Sia honour 'I want a female doctor'.")
 
 
 # -----------------------

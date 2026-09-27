@@ -63,9 +63,64 @@ def db():
 # Dentist Queries
 # -----------------------
 def get_all_dentists() -> List[Dentist]:
+    """Every practitioner currently working at the clinic. Practitioners
+    removed through the admin edit page are kept in the table (their past
+    appointments still point at them) but marked active=0 and left out here."""
     with db() as conn:
-        rows = conn.execute("SELECT * FROM dentists").fetchall()
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(dentists)")}
+        sql = "SELECT * FROM dentists" + (" WHERE COALESCE(active, 1) = 1" if "active" in cols else "")
+        rows = conn.execute(sql).fetchall()
         return [Dentist(**dict(row)) for row in rows]
+
+
+PRACTITIONER_FIELDS = (
+    "specialization", "languages_spoken", "qualifications", "years_experience",
+    "availability_schedule", "nationality", "department", "gender",
+)
+
+
+def sync_practitioners(practitioners: list) -> dict:
+    """Makes the dentists table match the list typed in the admin edit page
+    (same dict shape as clinic_config.yaml's `dentists:` entries).
+
+    Matched by name (case-insensitive): existing rows are updated in place,
+    so their IDs -- and every appointment pointing at them -- stay the same.
+    New names are added. Names no longer in the list are marked inactive
+    rather than deleted, so past appointments and dashboard history still
+    show who they were with. Returns counts of added/updated/deactivated."""
+    init_db(seed=False)
+    wanted = {}
+    for p in practitioners:
+        name = (p.get("name") or "").strip()
+        if name:
+            wanted[name.lower()] = p
+    added = updated = deactivated = 0
+    with db() as conn:
+        rows = conn.execute("SELECT id, name, COALESCE(active, 1) AS active FROM dentists").fetchall()
+        existing = {r["name"].strip().lower(): r for r in rows}
+        for key, p in wanted.items():
+            values = [p.get(f) for f in PRACTITIONER_FIELDS]
+            values[0] = values[0] or ""  # specialization is NOT NULL
+            if key in existing:
+                conn.execute(
+                    "UPDATE dentists SET name=?, " + ", ".join(f"{f}=?" for f in PRACTITIONER_FIELDS)
+                    + ", active=1 WHERE id=?",
+                    [p["name"].strip(), *values, existing[key]["id"]],
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    "INSERT INTO dentists (name, " + ", ".join(PRACTITIONER_FIELDS) + ", active) VALUES (?, "
+                    + ", ".join("?" for _ in PRACTITIONER_FIELDS) + ", 1)",
+                    [p["name"].strip(), *values],
+                )
+                added += 1
+        for key, row in existing.items():
+            if key not in wanted and row["active"]:
+                conn.execute("UPDATE dentists SET active=0 WHERE id=?", (row["id"],))
+                deactivated += 1
+    logger.info("Synced practitioners: %d added, %d updated, %d deactivated", added, updated, deactivated)
+    return {"added": added, "updated": updated, "deactivated": deactivated}
 
 
 def get_dentist(dentist_id: int) -> Optional[Dentist]:
@@ -325,7 +380,10 @@ CREATE TABLE IF NOT EXISTS dentists (
     qualifications TEXT,
     years_experience INTEGER,
     availability_schedule TEXT,
-    nationality TEXT
+    nationality TEXT,
+    department TEXT,
+    gender TEXT,
+    active INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS patients (
@@ -424,6 +482,17 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
         if "nationality" not in existing_dentist_columns:
             conn.execute("ALTER TABLE dentists ADD COLUMN nationality TEXT")
             logger.info("Migrated dentists table: added nationality column.")
+        # Clinic types & departments (see shared/clinic_types.py). NULL
+        # department = the clinic's main department, so every existing
+        # dentist keeps working exactly as before.
+        for column, ddl in (
+            ("department", "ALTER TABLE dentists ADD COLUMN department TEXT"),
+            ("gender", "ALTER TABLE dentists ADD COLUMN gender TEXT"),
+            ("active", "ALTER TABLE dentists ADD COLUMN active INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if column not in existing_dentist_columns:
+                conn.execute(ddl)
+                logger.info("Migrated dentists table: added %s column.", column)
 
         # Same idea for patients.created_at (added for the staff dashboard's
         # "new patients" reporting -- see shared/analytics.py). Existing rows
@@ -467,16 +536,18 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
                     dentists = get_dentists_config()
 
                 conn.executemany(
-                    "INSERT INTO dentists (name, specialization, languages_spoken, qualifications, years_experience, availability_schedule, nationality) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO dentists (name, specialization, languages_spoken, qualifications, years_experience, availability_schedule, nationality, department, gender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             d.get("name"),
-                            d.get("specialization"),
+                            d.get("specialization") or "",
                             d.get("languages_spoken"),
                             d.get("qualifications"),
                             d.get("years_experience"),
                             d.get("availability_schedule"),
                             d.get("nationality"),
+                            d.get("department"),
+                            d.get("gender"),
                         )
                         for d in dentists
                     ],

@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from shared import db as shared_db
 from shared.models import Dentist, Patient, Appointment
 from shared import clinic_config
+from shared import clinic_types
 
 logger = logging.getLogger(__name__)
 
@@ -212,10 +213,39 @@ BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. Y
                     "say so honestly, let them know staff will follow up, and call `flag_for_staff` with a short reason. Never "
                     "pretend to handle something you can't, and never make up information you don't have a tool to confirm.")
 
+# --- Clinic types & departments (shared/clinic_types.py) ---
+# A plain dental clinic -- every clinic that existed before clinic types --
+# gets BASE_SYSTEM_PROMPT above, word for word. Any other clinic (a
+# non-dental type, or extra departments on the same number) gets the same
+# prompt with the dental-only wording swapped for generic wording, plus a
+# block describing its departments and each type's rules.
+_DENTAL_INTRO = ("You are a helpful dental assistant. Your name is 'Sia'. You can help patients book, reschedule, "
+                 "or cancel appointments with dentists. ")
+_GENERIC_INTRO = ("You are a helpful clinic receptionist assistant. Your name is 'Sia'. You can help patients book, "
+                  "reschedule, or cancel appointments with the clinic's doctors and specialists. ")
+_RED_FLAG_MARKER = "RED-FLAG EMERGENCIES — if a patient describes any of the following, treat it as urgent: "
+_RED_FLAG_END = "accompanied by fever.\n"
+_GENERIC_RED_FLAG = ("RED-FLAG EMERGENCIES — if a patient describes any symptom listed as an emergency in the "
+                     "department rules above, or anything they describe as severe, worsening fast, or accompanied "
+                     "by fever, treat it as urgent.\n")
+
+
+def build_system_prompt(profile: Optional[Dict[str, Any]] = None) -> str:
+    profile = profile if profile is not None else clinic_config.get_clinic_profile()
+    if clinic_types.is_plain_dental(profile):
+        return BASE_SYSTEM_PROMPT
+    assert BASE_SYSTEM_PROMPT.startswith(_DENTAL_INTRO)
+    body = BASE_SYSTEM_PROMPT[len(_DENTAL_INTRO):]
+    start = body.index(_RED_FLAG_MARKER)
+    end = body.index(_RED_FLAG_END, start) + len(_RED_FLAG_END)
+    return (_GENERIC_INTRO + body[:start] + clinic_types.prompt_section(profile) + "\n\n"
+            + _GENERIC_RED_FLAG + body[end:])
+
+
 @mcp.prompt()
 def system_prompt() -> str:
-    """Returns the base system prompt for the dental assistant agent."""
-    return BASE_SYSTEM_PROMPT
+    """Returns the system prompt for this clinic's receptionist agent."""
+    return build_system_prompt()
 
 
 
@@ -338,10 +368,18 @@ def get_clinic_info() -> Dict[str, Any]:
     information, always call this tool.
     """
     logger.debug("Tool: get_clinic_info")
-    return {
+    info = {
         **clinic_config.get_clinic_info(),
         "services": clinic_config.get_services(),
     }
+    profile = clinic_config.get_clinic_profile()
+    if not clinic_types.is_plain_dental(profile):
+        info["departments"] = [
+            {"key": d["key"], "name": d["name"], "type": d["type"],
+             "bookable_here": d["active"], "women_only": d["women_only"]}
+            for d in clinic_types.departments(profile)
+        ]
+    return info
 
 
 @mcp.tool()
@@ -375,19 +413,40 @@ def send_offers_brochure(payload: SendOffersBrochurePayload) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def list_dentists(specialization: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_dentists(specialization: Optional[str] = None, department: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Retrieves a list of all available dentists, including each one's
-    nationality (when set — it may be blank for some dentists).
-    You can optionally filter the list by specialization (e.g., 'Orthodontist', 'Endodontist').
+    Retrieves a list of all available dentists (in clinics with other
+    departments: all the clinic's doctors and specialists), including each
+    one's nationality and gender (when set — they may be blank).
+    You can optionally filter the list by specialization (e.g., 'Orthodontist', 'Endodontist'),
+    and, in a clinic with several departments, by department (the department key or name from
+    get_clinic_info, e.g. 'laser').
     """
-    logger.debug("Tool: list_dentists, specialization=%s", specialization)
+    logger.debug("Tool: list_dentists, specialization=%s, department=%s", specialization, department)
     dentists = shared_db.get_all_dentists()
     if specialization:
-        filtered = [d for d in dentists if specialization.lower() in d.specialization.lower()]
-    else:
-        filtered = dentists
-    return [d.model_dump() for d in filtered]
+        dentists = [d for d in dentists if specialization.lower() in (d.specialization or "").lower()]
+    profile = clinic_config.get_clinic_profile()
+    if department and not clinic_types.is_plain_dental(profile):
+        wanted = clinic_types.find_department(profile, department)
+        if wanted is None:
+            return [{"error": "unknown_department",
+                     "departments": [d["key"] for d in clinic_types.departments(profile)]}]
+        dentists = [d for d in dentists
+                    if (clinic_types.find_department(profile, d.department) or {}).get("key") == wanted["key"]]
+    result = []
+    for d in dentists:
+        row = d.model_dump()
+        if not clinic_types.is_plain_dental(profile):
+            dept = clinic_types.find_department(profile, d.department)
+            row["department"] = dept["key"] if dept else d.department
+            row["department_bookable_here"] = dept["active"] if dept else True
+        else:
+            row.pop("department", None)
+            if row.get("gender") is None:
+                row.pop("gender", None)
+        result.append(row)
+    return result
 
 
 @mcp.tool()
@@ -493,6 +552,15 @@ def book_appointment(payload: BookAppointmentPayload) -> Dict[str, Any]:
         # regardless, by rejecting the request at the data layer.
         if datetime.fromisoformat(payload.appointment_time) < datetime.now():
             return {"error": "time_in_past", "details": "That appointment time has already passed. Please choose a future date and time."}
+
+        # Department checks (clinics with several departments only): an
+        # extra department whose own subscription ran out can't be booked,
+        # and a women-only department can't be booked for a male patient.
+        existing_patient = shared_db.get_patient_by_phone(payload.patient_whatsapp)
+        gender = payload.patient_gender or (existing_patient.gender if existing_patient else None)
+        blocked = clinic_types.booking_block(clinic_config.get_clinic_profile(), dentist.department, gender)
+        if blocked:
+            return blocked
 
         patient = _ensure_patient(
             whatsapp=payload.patient_whatsapp,

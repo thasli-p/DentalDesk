@@ -44,7 +44,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from shared import clinics_store, db, analytics
+from shared import clinics_store, db, analytics, clinic_types
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,17 @@ TRANSLATIONS = {
     "h2_services": {"en": "Most requested services", "ar": "الخدمات الأكثر طلبًا"},
     "h2_doctors": {"en": "Bookings by doctor", "ar": "الحجوزات حسب الطبيب"},
     "h2_specialties": {"en": "Bookings by specialty", "ar": "الحجوزات حسب التخصص"},
+    "h2_doctors_generic": {"en": "Bookings by practitioner", "ar": "الحجوزات حسب الأخصائي/الطبيب"},
+    "h2_departments": {"en": "Bookings by department", "ar": "الحجوزات حسب القسم"},
+    "departments_empty": {"en": "No bookings yet to break down by department.", "ar": "لا توجد حجوزات بعد لتصنيفها حسب القسم."},
+    "col_department": {"en": "Department", "ar": "القسم"},
+    "col_practitioner": {"en": "Practitioner", "ar": "الأخصائي/الطبيب"},
+    "dept_all": {"en": "All departments", "ar": "كل الأقسام"},
+    "dept_label": {"en": "Department", "ar": "القسم"},
+    "dept_hint": {
+        "en": "The department filter narrows bookings, the schedule and the booking charts. Conversation numbers always cover the whole clinic.",
+        "ar": "تصفية القسم تشمل الحجوزات والجدول ورسوم الحجوزات. أرقام المحادثات تشمل العيادة كاملة دائمًا.",
+    },
     "doctors_empty": {
         "en": "No bookings yet to break down by doctor.",
         "ar": "لا توجد حجوزات بعد لتصنيفها حسب الطبيب.",
@@ -300,6 +311,7 @@ PAGE_STYLE = """
   .periods { margin: 10px 0 4px 0; }
   .periods a { display: inline-block; padding: 6px 14px; margin-inline-end: 6px; border-radius: 16px; background: #f0f0f0; color: #333; text-decoration: none; font-size: 13px; }
   .periods a.active { background: #1a7f37; color: white; }
+  .dept-label { font-size: 13px; color: #555; margin-inline-end: 6px; }
   .kpi-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
   .kpi-card { flex: 1 1 150px; background: #f7f7f7; border-radius: 8px; padding: 14px 16px; }
   .kpi-value { font-size: 26px; font-weight: 700; }
@@ -372,7 +384,8 @@ def _fmt_money(value) -> str:
     return f"{value:,.0f} SAR"
 
 
-def _extra_qs(name_filter: str = "", date_from: str = "", date_to: str = "", sched: str = "", lang: str = DEFAULT_LANG) -> str:
+def _extra_qs(name_filter: str = "", date_from: str = "", date_to: str = "", sched: str = "", lang: str = DEFAULT_LANG,
+              dept: str = "") -> str:
     """&name=...&from=...&to=...&sched=...&lang=... fragment (possibly
     empty) for chaining onto other query strings, so links (period switch,
     conversation view, back button, schedule quick-links) don't silently
@@ -396,6 +409,8 @@ def _extra_qs(name_filter: str = "", date_from: str = "", date_to: str = "", sch
         parts.append(f"sched={quote(sched)}")
     if lang and lang != DEFAULT_LANG:
         parts.append(f"lang={quote(lang)}")
+    if dept:
+        parts.append(f"dept={quote(dept)}")
     return ("&" + "&".join(parts)) if parts else ""
 
 
@@ -544,15 +559,19 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
 
     kpis = data["kpis"]
     filters = data.get("filters", {})
+    multi = clinic_types.is_multi(clinic)
+    plain_dental = clinic_types.is_plain_dental(clinic)
+    practitioner_key = "col_dentist" if plain_dental else "col_practitioner"
     name_filter_val = filters.get("name", "")
     date_from_val = filters.get("from", "")
     date_to_val = filters.get("to", "")
-    filter_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, sched_param, lang)
+    dept_val = filters.get("dept", "")
+    filter_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, sched_param, lang, dept=dept_val)
 
     lang_toggle_target = "ar" if lang != "ar" else "en"
     lang_toggle_url = (
         f'/clinic/{clinic["slug"]}/dashboard?days={days_param}'
-        f'{_extra_qs(name_filter_val, date_from_val, date_to_val, sched_param, lang_toggle_target)}'
+        f'{_extra_qs(name_filter_val, date_from_val, date_to_val, sched_param, lang_toggle_target, dept=dept_val)}'
     )
 
     periods_html = ""
@@ -584,9 +603,9 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     schedule_resolved = data.get("schedule_date") or datetime.now().strftime("%Y-%m-%d")
     today_str = datetime.now().strftime("%Y-%m-%d")
     tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    no_sched_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, "", lang)
+    no_sched_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, "", lang, dept=dept_val)
     today_link = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{no_sched_qs}'
-    tomorrow_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, tomorrow_str, lang)
+    tomorrow_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, tomorrow_str, lang, dept=dept_val)
     tomorrow_link = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{tomorrow_qs}'
 
     schedule_picker_html = f"""
@@ -599,6 +618,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
       <input type="hidden" name="from" value="{html.escape(date_from_val)}">
       <input type="hidden" name="to" value="{html.escape(date_to_val)}">
       <input type="hidden" name="lang" value="{lang}">
+      <input type="hidden" name="dept" value="{html.escape(dept_val)}">
       <label>{_t('schedule_date_label', lang)} <input type="date" name="sched" value="{schedule_resolved}"></label>
       <button type="submit">{_t('schedule_go', lang)}</button>
     </form>
@@ -616,7 +636,8 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
                 f'<td>{_fmt_gender(a["patient_gender"], lang)}</td>'
                 f'<td>{html.escape(a["phone_number"] or "")}</td>'
                 f'<td>{html.escape(a["dentist_name"] or "")}</td>'
-                f'<td>{html.escape(a["service_name"] or "—")}</td>'
+                + (f'<td>{html.escape(a.get("department") or "")}</td>' if multi else '')
+                + f'<td>{html.escape(a["service_name"] or "—")}</td>'
                 f'<td>{badge}</td>'
                 f'<td>{_fmt_reminder(a, lang)}</td></tr>'
             )
@@ -624,7 +645,9 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
             f'<table><tr><th>{_t("col_time", lang)}</th><th>{_t("col_patient", lang)}</th>'
             f'<th>{_t("col_age", lang)}</th><th>{_t("col_gender", lang)}</th>'
             f'<th>{_t("col_whatsapp", lang)}</th>'
-            f'<th>{_t("col_dentist", lang)}</th><th>{_t("col_service", lang)}</th>'
+            f'<th>{_t(practitioner_key, lang)}</th>'
+            + (f'<th>{_t("col_department", lang)}</th>' if multi else '')
+            + f'<th>{_t("col_service", lang)}</th>'
             f'<th>{_t("col_status", lang)}</th><th>{_t("col_reminder", lang)}</th></tr>{rows}</table>'
         )
     else:
@@ -645,6 +668,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
       <input type="hidden" name="days" value="{days_param}">
       <input type="hidden" name="sched" value="{html.escape(sched_param)}">
       <input type="hidden" name="lang" value="{lang}">
+      <input type="hidden" name="dept" value="{html.escape(dept_val)}">
       <input type="text" name="name" placeholder="{_t('search_placeholder', lang)}" value="{html.escape(name_filter_val)}">
       <span class="date-field">{_t('filter_from', lang)} <input type="date" name="from" value="{html.escape(date_from_val)}"></span>
       <span class="date-field">{_t('filter_to', lang)} <input type="date" name="to" value="{html.escape(date_to_val)}"></span>
@@ -654,6 +678,26 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     <div class="filter-hint">{_t('filter_hint', lang)}</div>
   </div>
 """
+
+    # Department selector (clinics with several departments only).
+    dept_bar_html = ""
+    if multi:
+        base_qs = _extra_qs(name_filter_val, date_from_val, date_to_val, sched_param, lang)
+        links = [f'<a class="{"active" if not dept_val else ""}" href="?days={days_param}{base_qs}">{_t("dept_all", lang)}</a>']
+        for d in clinic_types.departments(clinic):
+            active = "active" if dept_val == d["key"] else ""
+            links.append(f'<a class="{active}" href="?days={days_param}{base_qs}&dept={quote(d["key"])}">{html.escape(d["name"])}</a>')
+        dept_bar_html = (f'<div class="periods"><span class="dept-label">{_t("dept_label", lang)}:</span> {"".join(links)}</div>'
+                         f'<div class="filter-hint">{_t("dept_hint", lang)}</div>')
+
+    departments_html = ""
+    if multi:
+        departments_html = _svg_hbar_chart(
+            data.get("top_departments", []), value_key="count", label_key="department", bar_color=CHART_BLUE,
+        )
+        if not data.get("top_departments"):
+            departments_html = f'<div class="empty">{_t("departments_empty", lang)}</div>'
+        departments_html = f"<h2>{_t('h2_departments', lang)}</h2>\n  {departments_html}"
 
     # Needs attention
     if data["needs_attention"]:
@@ -783,6 +827,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
   <div class="subtitle">{_period_label(days_param, lang)} · {_t('updated', lang)} {_fmt_dt(data['generated_at'])} · {_t('refresh_note', lang)}</div>
 
   <div class="periods">{periods_html}</div>
+  {dept_bar_html}
 
   <div class="kpi-grid">{kpi_html}</div>
 
@@ -807,7 +852,9 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
   <h2>{_t('h2_services', lang)}</h2>
   {services_html}
 
-  <h2>{_t('h2_doctors', lang)}</h2>
+  {departments_html}
+
+  <h2>{_t('h2_doctors' if plain_dental else 'h2_doctors_generic', lang)}</h2>
   {doctors_html}
 
   <h2>{_t('h2_specialties', lang)}</h2>
@@ -827,16 +874,16 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
 def _render_conversation_page(
     clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int,
     name_filter: str = "", date_from: str = "", date_to: str = "", sched_param: str = "",
-    lang: str = DEFAULT_LANG,
+    lang: str = DEFAULT_LANG, dept_val: str = "",
 ) -> str:
     lang = lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
     dir_attr = "rtl" if lang == "ar" else "ltr"
 
-    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_extra_qs(name_filter, date_from, date_to, sched_param, lang)}'
+    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_extra_qs(name_filter, date_from, date_to, sched_param, lang, dept=dept_val)}'
     lang_toggle_target = "ar" if lang != "ar" else "en"
     lang_toggle_url = (
         f'/clinic/{clinic["slug"]}/dashboard/conversation/{conversation.id}?days={days_param}'
-        f'{_extra_qs(name_filter, date_from, date_to, sched_param, lang_toggle_target)}'
+        f'{_extra_qs(name_filter, date_from, date_to, sched_param, lang_toggle_target, dept=dept_val)}'
     )
 
     if conversation.flagged_for_staff:
@@ -913,6 +960,7 @@ async def clinic_dashboard_conversation(
     date_to: Optional[str] = Query(None, alias="to"),
     sched: Optional[str] = Query(None),
     lang: str = Query(DEFAULT_LANG),
+    dept: Optional[str] = Query(None),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
@@ -946,7 +994,7 @@ async def clinic_dashboard_conversation(
 
     return HTMLResponse(_render_conversation_page(
         clinic, conversation, patient, messages, booked, days,
-        name or "", date_from or "", date_to or "", sched or "", lang,
+        name or "", date_from or "", date_to or "", sched or "", lang, dept or "",
     ))
 
 
@@ -958,6 +1006,7 @@ async def clinic_dashboard(
     date_to: Optional[str] = Query(None, alias="to"),
     sched: Optional[str] = Query(None),
     lang: str = Query(DEFAULT_LANG),
+    dept: Optional[str] = Query(None),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
@@ -966,7 +1015,7 @@ async def clinic_dashboard(
     db.set_current_db_path(clinic["db_path"])
     data = analytics.get_dashboard_summary(
         days=_days_param(days), name_filter=name, date_from=date_from, date_to=date_to,
-        schedule_date=sched,
+        schedule_date=sched, department=dept, clinic_profile=clinic,
     )
     return HTMLResponse(_render_page(clinic, data, days, sched or "", lang))
 
@@ -978,6 +1027,7 @@ async def clinic_dashboard_api(
     date_from: Optional[str] = Query(None, alias="from"),
     date_to: Optional[str] = Query(None, alias="to"),
     sched: Optional[str] = Query(None),
+    dept: Optional[str] = Query(None),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
@@ -986,7 +1036,7 @@ async def clinic_dashboard_api(
     db.set_current_db_path(clinic["db_path"])
     data = analytics.get_dashboard_summary(
         days=_days_param(days), name_filter=name, date_from=date_from, date_to=date_to,
-        schedule_date=sched,
+        schedule_date=sched, department=dept, clinic_profile=clinic,
     )
     return {
         "clinic": {"name": clinic["name"], "slug": clinic["slug"]},

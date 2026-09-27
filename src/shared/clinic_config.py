@@ -56,6 +56,15 @@ def get_services() -> List[Dict[str, Any]]:
     return load_clinic_config().get("services", [])
 
 
+def get_clinic_profile() -> Dict[str, Any]:
+    """Clinic type + departments in the shape shared/clinic_types.py
+    expects (the `clinic` section plus the top-level `departments` list).
+    A config written before clinic types existed has neither, which means
+    a plain dental clinic."""
+    config = load_clinic_config()
+    return {**(config.get("clinic") or {}), "departments": config.get("departments") or []}
+
+
 def get_dentists_config() -> List[Dict[str, Any]]:
     """The list of dentists defined in the config file."""
     return load_clinic_config().get("dentists", [])

@@ -36,7 +36,8 @@ from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from shared import clinics_store
+from shared import clinics_store, clinic_types
+from shared import db as clinic_db
 from app.clinic_registry import launch_clinic_worker, stop_clinic_worker
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,10 @@ def _parse_services(text: str):
                 price_val = float(price)
             except ValueError:
                 price_val = price
-        services.append({"name": name, "price_sar": price_val})
+        service = {"name": name, "price_sar": price_val}
+        if len(parts) > 2 and parts[2]:
+            service["department"] = parts[2]  # optional: which department offers it (blank = main)
+        services.append(service)
     return services
 
 
@@ -100,11 +104,11 @@ def _parse_dentists(text: str):
         if not line:
             continue
         parts = [p.strip() for p in line.split("|")]
-        parts += [""] * (7 - len(parts))
-        name, specialization, nationality, languages, qualifications, years, availability = parts[:7]
+        parts += [""] * (9 - len(parts))
+        name, specialization, nationality, languages, qualifications, years, availability, department, gender = parts[:9]
         if not name:
             continue
-        dentists.append({
+        entry = {
             "name": name,
             "specialization": specialization,
             "nationality": nationality or None,
@@ -112,8 +116,132 @@ def _parse_dentists(text: str):
             "qualifications": qualifications,
             "years_experience": int(years) if years.isdigit() else None,
             "availability_schedule": availability,
-        })
+        }
+        # Two optional extra columns, only needed for clinics with several
+        # departments / clinics that care about practitioner gender.
+        if department:
+            entry["department"] = department
+        if gender:
+            entry["gender"] = _normalize_gender(gender)
+        dentists.append(entry)
     return dentists
+
+
+def _normalize_gender(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v in ("m", "male", "man", "ذكر", "رجل"):
+        return "Male"
+    if v in ("f", "female", "woman", "أنثى", "انثى", "امرأة"):
+        return "Female"
+    return value.strip()
+
+
+def _parse_departments(text: str):
+    """One extra department per line: Name | Type | Plan | Start date | women only.
+    Returns (departments, errors). The main department is the clinic type
+    itself and isn't listed here."""
+    departments, errors = [], []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        parts += [""] * (5 - len(parts))
+        name, type_, plan, started, women = parts[:5]
+        if not name:
+            continue
+        type_key = (type_ or "").strip().lower()
+        if type_key not in clinic_types.CLINIC_TYPES:
+            errors.append(f'"{name}": type must be one of {", ".join(clinic_types.CLINIC_TYPES)} (got "{type_}").')
+            continue
+        plan = plan or "trial"
+        if plan not in SUBSCRIPTION_PLAN_CHOICES:
+            errors.append(f'"{name}": plan must be one of {", ".join(SUBSCRIPTION_PLAN_CHOICES)} (got "{plan}").')
+            continue
+        started = started or datetime.now().strftime("%Y-%m-%d")
+        try:
+            datetime.strptime(started, "%Y-%m-%d")
+        except ValueError:
+            errors.append(f'"{name}": start date must look like 2026-09-27 (got "{started}").')
+            continue
+        departments.append({
+            "name": name,
+            "key": clinic_types.dept_key(name),
+            "type": type_key,
+            "subscription_plan": plan,
+            "subscription_started_at": started,
+            "women_only": women.lower() in ("yes", "y", "women only", "women", "نعم", "1", "true"),
+        })
+    return departments, errors
+
+
+def _unknown_department_errors(profile: dict, services, dentists):
+    """Every department named on a service or practitioner must exist."""
+    errors = []
+    names = ", ".join(d["name"] for d in clinic_types.departments(profile))
+    for item, what in [(s, "Service") for s in services] + [(d, "Practitioner") for d in dentists]:
+        if item.get("department") and clinic_types.find_department(profile, item["department"]) is None:
+            errors.append(f'{what} "{item["name"]}": department "{item["department"]}" is not one of this '
+                          f"clinic's departments ({names}).")
+    return errors
+
+
+def _format_services(services) -> str:
+    lines = []
+    for s in services or []:
+        parts = [str(s.get("name", "")), str(s.get("price_sar", ""))]
+        if s.get("department"):
+            parts.append(str(s["department"]))
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_practitioners(dentists) -> str:
+    lines = []
+    for d in dentists or []:
+        get = (lambda k: getattr(d, k, None)) if not isinstance(d, dict) else d.get
+        parts = [
+            get("name") or "", get("specialization") or "", get("nationality") or "",
+            get("languages_spoken") or "", get("qualifications") or "",
+            str(get("years_experience") or ""), get("availability_schedule") or "",
+            get("department") or "", get("gender") or "",
+        ]
+        while parts and not parts[-1]:
+            parts.pop()
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_departments(departments) -> str:
+    return "\n".join(
+        " | ".join([
+            d.get("name", ""), d.get("type", ""), d.get("subscription_plan") or "",
+            d.get("subscription_started_at") or "", "yes" if d.get("women_only") else "",
+        ]).rstrip(" |")
+        for d in departments or []
+    )
+
+
+def _type_options(selected: str) -> str:
+    return "".join(
+        f'<option value="{k}"{" selected" if k == selected else ""}>{html.escape(v["label_en"])}</option>'
+        for k, v in clinic_types.CLINIC_TYPES.items()
+    )
+
+
+def _departments_cell(c: dict) -> str:
+    """Type + departments summary for the clinics table."""
+    depts = clinic_types.departments(c)
+    bits = [f'<b>{html.escape(clinic_types.type_label(c.get("clinic_type")))}</b>'
+            + (' <span class="hint">(women only)</span>' if c.get("main_women_only") else "")]
+    for d in depts[1:]:
+        ends = d.get("ends_on") or "?"
+        state = (f'<span class="days-ok">until {ends}</span>' if d["active"]
+                 else f'<span class="days-expired">⛔ ended {ends}</span>')
+        bits.append(f'+ {html.escape(d["name"])} <span class="hint">({html.escape(clinic_types.type_label(d["type"]))}, '
+                    f'{html.escape((d.get("plan") or "").replace("_", " "))})</span> {state}')
+    bits.append(f'<a href="/admin/clinics/{c["id"]}/setup">Edit type, departments &amp; staff</a>')
+    return "<br>".join(bits)
 
 
 def _parse_holidays(text: str):
@@ -183,6 +311,22 @@ PAGE_STYLE = """
 
 RENEWAL_WARNING_DAYS = 30
 
+DEPARTMENTS_HINT = (
+    "Only if this clinic has other sections that share this WhatsApp number (e.g. a dental clinic with a laser "
+    "room). Each extra department is its own subscription. One per line: "
+    "Name | Type | Plan | Start date | women only. Type is one of: "
+    + ", ".join(clinic_types.CLINIC_TYPES) + ". Plan is one of: trial, 1_month, 3_months, 6_months, 12_months. "
+    "Write yes at the end if that section serves women only. When a department's plan ends, Sia stops booking "
+    "that department and tells patients to call; the rest of the clinic keeps working."
+)
+PRACTITIONERS_HINT = (
+    "One per line: Name | Specialization | Nationality | Languages | Qualifications | Years experience | "
+    "Availability | Department | Gender. The last two are optional: Department is only needed when the clinic "
+    "has extra departments (blank = main department), Gender (Male/Female) lets Sia honour \"I want a female "
+    "doctor\". Leave any spot empty between the | |. "
+    "Example: Dr. Asha Rao | Orthodontist | Indian | English, Hindi | BDS, MDS | 12 | Mon-Fri 10:00-17:00 | | Female"
+)
+
 
 def _days_left_html(clinic: dict) -> str:
     """Days until this clinic's plan runs out, flagged when under a month."""
@@ -220,6 +364,7 @@ def _render_page(message_html: str = "") -> str:
                 <td>{html.escape(c['whatsapp_phone_number_id'])}</td>
                 <td>{html.escape(c['subscription_plan'].replace('_', ' '))}<br><span class="hint">since {html.escape(c['subscription_started_at'])}</span></td>
                 <td>{_days_left_html(c)}</td>
+                <td>{_departments_cell(c)}</td>
                 <td>
                     <span class="{'voice-on' if c['voice_enabled'] else 'voice-off'}">{'📞 On' if c['voice_enabled'] else 'Off'}</span>
                     <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/voice">
@@ -244,7 +389,7 @@ def _render_page(message_html: str = "") -> str:
                 </td>
             </tr>"""
     else:
-        rows = "<tr><td colspan=9>No clinics yet -- add the first one below.</td></tr>"
+        rows = "<tr><td colspan=10>No clinics yet -- add the first one below.</td></tr>"
 
     plan_options = "".join(
         f'<option value="{p}">{p.replace("_", " ")}</option>' for p in SUBSCRIPTION_PLAN_CHOICES
@@ -261,7 +406,7 @@ def _render_page(message_html: str = "") -> str:
   <h2>Current clinics</h2>
   {_renewal_summary_html(clinics)}
   <table>
-    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Days left before renewal</th><th>Voice calls</th><th>Status</th><th>Staff dashboard</th><th></th></tr>
+    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Days left before renewal</th><th>Type &amp; departments</th><th>Voice calls</th><th>Status</th><th>Staff dashboard</th><th></th></tr>
     {rows}
   </table>
 
@@ -276,6 +421,26 @@ def _render_page(message_html: str = "") -> str:
 
     <label>Clinic name
       <input type="text" name="name" required placeholder="Al Waha Dental Clinic">
+    </label>
+
+    <div class="row">
+      <div>
+        <label>Clinic type (main department)
+          <span class="hint">What this WhatsApp number mainly is. Its subscription (below) covers this department.</span>
+          <select name="clinic_type">{_type_options("dental")}</select>
+        </label>
+      </div>
+      <div>
+        <label class="check-label" style="margin-top:34px">
+          <input type="checkbox" name="main_women_only" value="1">
+          <span>Main department serves women only</span>
+        </label>
+      </div>
+    </div>
+
+    <label>Extra departments on this same number (optional)
+      <span class="hint">{DEPARTMENTS_HINT}</span>
+      <textarea name="departments" rows="3" placeholder="Laser | laser | 3_months | {today} | yes"></textarea>
     </label>
 
     <div class="row">
@@ -342,14 +507,13 @@ def _render_page(message_html: str = "") -> str:
     </label>
 
     <label>Services and prices
-      <span class="hint">One per line: Name | Price in SAR. Example: Teeth Cleaning | 250</span>
+      <span class="hint">One per line: Name | Price in SAR. Example: Teeth Cleaning | 250.
+      With extra departments, add the department as a third part: Laser Full Body | 900 | Laser (blank = main department).</span>
       <textarea name="services" rows="6" placeholder="Consultation / Visit Fee | 300&#10;Regular Checkup | 150&#10;Teeth Cleaning | 250"></textarea>
     </label>
 
-    <label>Dentists
-      <span class="hint">One per line: Name | Specialization | Nationality | Languages | Qualifications | Years experience | Availability.
-      Nationality can be left blank (just leave that spot empty between the | |).
-      Example: Dr. Asha Rao | Orthodontist | Indian | English, Hindi | BDS, MDS | 12 | Mon-Fri 10:00-17:00</span>
+    <label>Dentists / doctors / specialists
+      <span class="hint">{PRACTITIONERS_HINT}</span>
       <textarea name="dentists" rows="6" placeholder="Dr. Asha Rao | Orthodontist | Indian | English, Hindi | BDS, MDS | 12 | Mon-Fri 10:00-17:00"></textarea>
     </label>
 
@@ -411,8 +575,19 @@ async def admin_add_clinic(
     subscription_started_at: str = Form(""),
     voice_enabled: str = Form(""),
     voice_number: str = Form(""),
+    clinic_type: str = Form("dental"),
+    main_women_only: str = Form(""),
+    departments: str = Form(""),
     offers_image: Optional[UploadFile] = File(None),
 ):
+    parsed_departments, dept_errors = _parse_departments(departments)
+    dept_errors += _unknown_department_errors(
+        {"clinic_type": clinic_types.normalize_type(clinic_type), "departments": parsed_departments},
+        _parse_services(services), _parse_dentists(dentists))
+    if dept_errors:
+        return HTMLResponse(_render_page(
+            '<div class="flash-err">Extra departments need fixing. Nothing was added.\n'
+            + html.escape("\n".join(dept_errors)) + '</div>'))
     if voice_number.strip():
         taken = clinics_store.get_clinic_by_voice_number(voice_number)
         if taken:
@@ -445,6 +620,9 @@ async def admin_add_clinic(
         subscription_plan=subscription_plan,
         subscription_started_at=subscription_started_at or None,
         voice_enabled=voice_enabled == "1",
+        clinic_type=clinic_types.normalize_type(clinic_type),
+        main_women_only=main_women_only == "1",
+        departments=parsed_departments,
     )
     if voice_number.strip():
         clinic["voice_number"] = clinics_store.set_voice_number(clinic["id"], voice_number)
@@ -542,3 +720,136 @@ async def admin_delete_clinic(clinic_id: int, _: bool = Depends(require_admin)):
         f"this clinic is gone for good (see claude/how-to-add-remove-clinic-whatsapp-number.md).</div>"
     )
     return HTMLResponse(_render_page(message))
+
+
+# -------------------------
+# Edit page: clinic type, extra departments, services and practitioners of
+# an EXISTING clinic. Saving rewrites the clinic's config, updates its
+# practitioners in its own database, and restarts its worker so Sia picks up
+# the new setup straight away (a few seconds; no redeploy).
+# -------------------------
+def _render_setup_page(clinic: dict, message_html: str = "", form: Optional[dict] = None) -> str:
+    config = clinics_store.read_clinic_config(clinic)
+    if form is None:
+        clinic_db.set_current_db_path(clinic["db_path"])
+        try:
+            clinic_db.init_db(seed=False)
+            practitioners = clinic_db.get_all_dentists()
+        except Exception:
+            logger.exception("Could not read practitioners for clinic %s", clinic["slug"])
+            practitioners = clinic.get("dentists") or []
+        form = {
+            "clinic_type": clinic.get("clinic_type") or "dental",
+            "main_women_only": clinic.get("main_women_only"),
+            "departments": _format_departments(clinic.get("departments")),
+            "services": _format_services(config.get("services") if config else clinic.get("services")),
+            "dentists": _format_practitioners(practitioners),
+        }
+    checked = " checked" if form.get("main_women_only") else ""
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Mawaid — {html.escape(clinic['name'])} setup</title>{PAGE_STYLE}</head>
+<body>
+  <div class="brand-row"><img src="/static/logo.png" alt="Mawaid"><h1>{html.escape(clinic['name'])} — type, departments &amp; staff</h1></div>
+  <p><a href="/admin/clinics">&larr; Back to all clinics</a></p>
+  {message_html}
+  <p class="hint">Saving updates what Sia knows about this clinic and restarts its WhatsApp worker (takes a few seconds;
+  a patient writing in exactly that moment may need to send their message again). Hours, address and offers are not
+  changed here.</p>
+  <form method="post" action="/admin/clinics/{clinic['id']}/setup">
+    <div class="row">
+      <div>
+        <label>Clinic type (main department)
+          <span class="hint">Covered by this clinic's own subscription ({html.escape(clinic['subscription_plan'].replace('_', ' '))}).</span>
+          <select name="clinic_type">{_type_options(form.get("clinic_type") or "dental")}</select>
+        </label>
+      </div>
+      <div>
+        <label class="check-label" style="margin-top:34px">
+          <input type="checkbox" name="main_women_only" value="1"{checked}>
+          <span>Main department serves women only</span>
+        </label>
+      </div>
+    </div>
+
+    <label>Extra departments on this same number
+      <span class="hint">{DEPARTMENTS_HINT} To renew a department, change its plan/start date and save.</span>
+      <textarea name="departments" rows="4" placeholder="Laser | laser | 3_months | {datetime.now().strftime('%Y-%m-%d')} | yes">{html.escape(form.get("departments") or "")}</textarea>
+    </label>
+
+    <label>Services and prices
+      <span class="hint">One per line: Name | Price in SAR | Department (department only for extra departments; blank = main).</span>
+      <textarea name="services" rows="8">{html.escape(form.get("services") or "")}</textarea>
+    </label>
+
+    <label>Dentists / doctors / specialists
+      <span class="hint">{PRACTITIONERS_HINT} People removed from this list stop being bookable; their past
+      appointments stay on record.</span>
+      <textarea name="dentists" rows="8">{html.escape(form.get("dentists") or "")}</textarea>
+    </label>
+
+    <button type="submit">Save and restart this clinic's Sia</button>
+  </form>
+</body>
+</html>"""
+
+
+@router.get("/admin/clinics/{clinic_id}/setup", response_class=HTMLResponse)
+async def admin_setup_page(clinic_id: int, _: bool = Depends(require_admin)):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic:
+        return HTMLResponse(_render_page('<div class="flash-err">No clinic with that id.</div>'))
+    return HTMLResponse(_render_setup_page(clinic))
+
+
+@router.post("/admin/clinics/{clinic_id}/setup", response_class=HTMLResponse)
+async def admin_save_setup(
+    clinic_id: int,
+    _: bool = Depends(require_admin),
+    clinic_type: str = Form("dental"),
+    main_women_only: str = Form(""),
+    departments: str = Form(""),
+    services: str = Form(""),
+    dentists: str = Form(""),
+):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic:
+        return HTMLResponse(_render_page('<div class="flash-err">No clinic with that id.</div>'))
+    form = {"clinic_type": clinic_type, "main_women_only": main_women_only == "1",
+            "departments": departments, "services": services, "dentists": dentists}
+
+    parsed_departments, errors = _parse_departments(departments)
+    parsed_services = _parse_services(services)
+    parsed_dentists = _parse_dentists(dentists)
+    if not parsed_dentists:
+        errors.append("Add at least one dentist/doctor/specialist.")
+
+    errors += _unknown_department_errors(
+        {"clinic_type": clinic_types.normalize_type(clinic_type), "departments": parsed_departments},
+        parsed_services, parsed_dentists)
+    if errors:
+        return HTMLResponse(_render_setup_page(
+            clinic, '<div class="flash-err">Nothing was saved yet -- please fix:\n' + html.escape("\n".join(errors)) + '</div>', form))
+
+    updated = clinics_store.update_clinic_setup(
+        clinic_id,
+        clinic_type=clinic_types.normalize_type(clinic_type),
+        main_women_only=main_women_only == "1",
+        departments=parsed_departments,
+        services=parsed_services,
+        dentists=parsed_dentists,
+    )
+    clinic_db.set_current_db_path(updated["db_path"])
+    counts = clinic_db.sync_practitioners(parsed_dentists)
+
+    restarted = ""
+    if updated["active"]:
+        stop_clinic_worker(clinic_id)
+        launch_clinic_worker(updated)
+        restarted = " Sia was restarted for this clinic with the new setup."
+
+    message = (
+        f'<div class="flash-ok">✅ Saved. {counts["added"]} practitioner(s) added, {counts["updated"]} updated, '
+        f'{counts["deactivated"]} no longer bookable.{restarted}</div>'
+    )
+    return HTMLResponse(_render_setup_page(updated, message))

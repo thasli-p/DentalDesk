@@ -409,9 +409,17 @@ class ClinicWorker:
 
                 self.agent = await self.create_graph(session)
 
-                asyncio.create_task(self.conversation_cleanup_task())
-
                 from app.reminders import reminder_loop
-                asyncio.create_task(reminder_loop(self))
-
-                await self.consume_messages()
+                # Kept so they stop together with this worker: when a clinic
+                # is deleted, or restarted after its setup is edited in
+                # /admin/clinics, the old reminder loop must not keep running
+                # next to the new one (it would send duplicate reminders).
+                background = [
+                    asyncio.create_task(self.conversation_cleanup_task()),
+                    asyncio.create_task(reminder_loop(self)),
+                ]
+                try:
+                    await self.consume_messages()
+                finally:
+                    for task in background:
+                        task.cancel()

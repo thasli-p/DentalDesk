@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from shared import clinics_store, db
+from shared import clinics_store, db, clinic_types
 from shared.models import Appointment, Patient
 
 logger = logging.getLogger(__name__)
@@ -338,6 +338,10 @@ def _check_bookable(clinic: dict, dentist_id: int, when: datetime,
     dentist = db.get_dentist(dentist_id)
     if not dentist:
         return {"error": "dentist_not_found", "details": "Unknown dentist_id. Call get_clinic_context for the list."}
+    if exclude_id is None:  # new bookings only -- an existing appointment can still be moved
+        blocked = clinic_types.booking_block(clinic, dentist.department)
+        if blocked:
+            return blocked
     problem = _problem_at(clinic, dentist, when, exclude_id)
     if not problem:
         return None
@@ -349,12 +353,27 @@ def _check_bookable(clinic: dict, dentist_id: int, when: datetime,
     }
 
 
+def _department_of(clinic: dict, dentist) -> Optional[Dict[str, Any]]:
+    """The practitioner's department, only for clinics that have several
+    (None for a plain one-department clinic, which keeps its old replies)."""
+    if not clinic_types.is_multi(clinic):
+        return None
+    return clinic_types.find_department(clinic, dentist.department)
+
+
 def _free_dentists_at(clinic: dict, when: datetime) -> List[Dict[str, Any]]:
-    return [
-        {"dentist_id": d.id, "name": d.name, "specialization": d.specialization}
-        for d in db.get_all_dentists()
-        if not _problem_at(clinic, d, when)
-    ]
+    free = []
+    for d in db.get_all_dentists():
+        dept = _department_of(clinic, d)
+        if dept is not None and not dept["active"]:
+            continue
+        if _problem_at(clinic, d, when):
+            continue
+        entry = {"dentist_id": d.id, "name": d.name, "specialization": d.specialization}
+        if dept is not None:
+            entry["department"] = dept["name"]
+        free.append(entry)
+    return free
 
 
 PLACEHOLDER_NAMES = ("", "New Patient")
@@ -529,16 +548,22 @@ async def get_clinic_context(slug: str, caller_phone: Optional[str] = None,
     clinic = _load_clinic(slug)
     now = datetime.now()
     upcoming_holidays = [h for h in (clinic.get("holidays") or []) if h >= now.strftime("%Y-%m-%d")]
-    dentists = [
-        {
+    dentists = []
+    for d in db.get_all_dentists():
+        entry = {
             "dentist_id": d.id,
             "name": d.name,
             "specialization": d.specialization,
             "languages": d.languages_spoken,
             "works": describe_schedule(effective_schedule(clinic, d)) or d.availability_schedule,
         }
-        for d in db.get_all_dentists()
-    ]
+        dept = _department_of(clinic, d)
+        if dept is not None:
+            entry["department"] = dept["name"]
+            entry["bookable_by_phone"] = dept["active"]
+        if d.gender:
+            entry["gender"] = d.gender
+        dentists.append(entry)
     result = {
         "now": now.isoformat(timespec="minutes"),
         "today": _day_label(now),
@@ -551,6 +576,11 @@ async def get_clinic_context(slug: str, caller_phone: Optional[str] = None,
         "dentists": dentists,
         "caller": _caller_summary(caller_phone, now),
     }
+    if not clinic_types.is_plain_dental(clinic):
+        result["departments"] = [
+            {"name": d["name"], "type": d["type"], "bookable_by_phone": d["active"], "women_only": d["women_only"]}
+            for d in clinic_types.departments(clinic)
+        ]
     return result
 
 
@@ -607,6 +637,9 @@ async def check_slot(slug: str, body: CheckSlotBody, x_voice_key: Optional[str] 
         # Nobody free: suggest the soonest times per dentist.
         options = []
         for d in db.get_all_dentists():
+            dept = _department_of(clinic, d)
+            if dept is not None and not dept["active"]:
+                continue
             times = _next_free_times(clinic, d, when, count=2)
             if times:
                 options.append({"dentist_id": d.id, "name": d.name, "next_free_times": times})

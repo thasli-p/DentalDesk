@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS clinics (
     voice_enabled INTEGER NOT NULL DEFAULT 0,
     voice_number TEXT,
 
+    clinic_type TEXT NOT NULL DEFAULT 'dental',
+    main_women_only INTEGER NOT NULL DEFAULT 0,
+    departments_json TEXT NOT NULL DEFAULT '[]',
+
     db_path TEXT NOT NULL,
     config_path TEXT NOT NULL,
     static_dir TEXT NOT NULL,
@@ -125,6 +129,17 @@ def init_control_db():
         if "voice_number" not in existing_columns:
             conn.execute("ALTER TABLE clinics ADD COLUMN voice_number TEXT")
             logger.info("Migrated clinics table: added voice_number column.")
+        # Clinic types & departments (shared/clinic_types.py). Every clinic
+        # that existed before is a dental clinic with no extra departments.
+        if "clinic_type" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN clinic_type TEXT NOT NULL DEFAULT 'dental'")
+            logger.info("Migrated clinics table: added clinic_type column.")
+        if "main_women_only" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN main_women_only INTEGER NOT NULL DEFAULT 0")
+            logger.info("Migrated clinics table: added main_women_only column.")
+        if "departments_json" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN departments_json TEXT NOT NULL DEFAULT '[]'")
+            logger.info("Migrated clinics table: added departments_json column.")
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -132,6 +147,9 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     d["holidays"] = json.loads(d.pop("holidays_json") or "[]")
     d["services"] = json.loads(d.pop("services_json") or "[]")
     d["dentists"] = json.loads(d.pop("dentists_json") or "[]")
+    d["departments"] = json.loads(d.pop("departments_json", None) or "[]")
+    d["clinic_type"] = d.get("clinic_type") or "dental"
+    d["main_women_only"] = bool(d.get("main_women_only"))
     d["active"] = bool(d["active"])
     d["voice_enabled"] = bool(d.get("voice_enabled"))
     return d
@@ -288,7 +306,10 @@ def write_clinic_config_yaml(clinic: Dict[str, Any]):
             "offers_text": clinic.get("offers_text") or "",
             "offers_image_filename": clinic.get("offers_image_filename"),
             "holidays": clinic.get("holidays") or [],
+            "clinic_type": clinic.get("clinic_type") or "dental",
+            "main_women_only": bool(clinic.get("main_women_only")),
         },
+        "departments": clinic.get("departments") or [],
         "services": clinic.get("services") or [],
         "dentists": clinic.get("dentists") or [],
     }
@@ -316,6 +337,9 @@ def add_clinic(
     subscription_plan: str = "trial",
     subscription_started_at: Optional[str] = None,
     voice_enabled: bool = False,
+    clinic_type: str = "dental",
+    main_women_only: bool = False,
+    departments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Adds a new clinic and creates its own private data folder
     (data/clinics/<slug>/) for its database, config file, and uploaded
@@ -343,8 +367,9 @@ def add_clinic(
                 offers_text, offers_image_filename,
                 holidays_json, services_json, dentists_json,
                 subscription_plan, subscription_started_at, dashboard_password, voice_enabled,
+                clinic_type, main_women_only, departments_json,
                 db_path, config_path, static_dir, created_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug, name,
@@ -353,6 +378,7 @@ def add_clinic(
                 offers_text, offers_image_filename,
                 json.dumps(holidays or []), json.dumps(services or []), json.dumps(dentists or []),
                 subscription_plan, started_at, dashboard_password, 1 if voice_enabled else 0,
+                clinic_type or "dental", 1 if main_women_only else 0, json.dumps(departments or []),
                 db_path, config_path, static_dir, datetime.now().isoformat(),
             ),
         )
@@ -362,6 +388,88 @@ def add_clinic(
     write_clinic_config_yaml(clinic)
     logger.info("Added new clinic id=%s slug=%s name=%r", clinic_id, slug, name)
     return clinic
+
+
+def update_clinic_setup(
+    clinic_id: int,
+    *,
+    clinic_type: str,
+    main_women_only: bool,
+    departments: List[Dict[str, Any]],
+    services: List[Dict[str, Any]],
+    dentists: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Saves the admin edit page (clinic type, departments, services,
+    practitioners) and rewrites the clinic_config.yaml Sia reads.
+
+    The yaml is MERGED rather than regenerated: every other setting in it
+    (hours, address, offers...) is kept exactly as it is. For the original
+    clinic carried over from the single-clinic days, whose yaml lives in
+    the app's git folder (not on the persistent volume, so edits there
+    vanish on the next deploy), the merged file is written into its own
+    data/clinics/<slug>/ folder instead and the clinic is pointed at it --
+    from then on its settings survive redeploys like every other clinic's.
+
+    Practitioners in the clinic's database are synced separately by the
+    caller (shared/db.sync_practitioners), with that clinic's db selected."""
+    import yaml
+
+    clinic = get_clinic(clinic_id)
+    if not clinic:
+        raise ValueError("No clinic with that id.")
+
+    existing: Dict[str, Any] = {}
+    if clinic.get("config_path") and os.path.exists(clinic["config_path"]):
+        with open(clinic["config_path"], "r", encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+
+    config_path = clinic["config_path"]
+    data_root_abs = os.path.abspath(DATA_ROOT)
+    if os.path.commonpath([os.path.abspath(config_path), data_root_abs]) != data_root_abs:
+        config_path = os.path.join(DATA_ROOT, clinic["slug"], "clinic_config.yaml")
+
+    info = dict(existing.get("clinic") or {})
+    if not info:
+        info = {
+            "name": clinic["name"], "general_hours": clinic.get("general_hours") or "",
+            "parking": clinic.get("parking") or "", "phone": clinic.get("phone") or "",
+            "address": clinic.get("address") or "", "google_maps_link": clinic.get("google_maps_link") or "",
+            "offers_text": clinic.get("offers_text") or "",
+            "offers_image_filename": clinic.get("offers_image_filename"),
+            "holidays": clinic.get("holidays") or [],
+        }
+    info["clinic_type"] = clinic_type or "dental"
+    info["main_women_only"] = bool(main_women_only)
+    data = dict(existing)
+    data["clinic"] = info
+    data["departments"] = departments
+    data["services"] = services
+    data["dentists"] = dentists
+
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    with _db() as conn:
+        conn.execute(
+            "UPDATE clinics SET clinic_type=?, main_women_only=?, departments_json=?, services_json=?, "
+            "dentists_json=?, config_path=? WHERE id=?",
+            (clinic_type or "dental", 1 if main_women_only else 0, json.dumps(departments),
+             json.dumps(services), json.dumps(dentists), config_path, clinic_id),
+        )
+    logger.info("Updated setup for clinic id=%s (type=%s, %d extra departments)", clinic_id, clinic_type, len(departments))
+    return get_clinic(clinic_id)
+
+
+def read_clinic_config(clinic: Dict[str, Any]) -> Dict[str, Any]:
+    """The clinic_config.yaml Sia actually reads for this clinic (empty
+    dict if missing) -- what the admin edit page pre-fills from."""
+    import yaml
+    path = clinic.get("config_path")
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 def update_offers_image_filename(clinic_id: int, filename: str):

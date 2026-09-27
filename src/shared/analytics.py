@@ -84,6 +84,8 @@ def get_dashboard_summary(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     schedule_date: Optional[str] = None,
+    department: Optional[str] = None,
+    clinic_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
@@ -116,7 +118,23 @@ def get_dashboard_summary(
     appointments the schedule section shows -- defaults to today when
     absent/malformed. Independent of every other filter on this page: it's
     a "what does tomorrow look like" lookup, not a report window.
+
+    department (a department key, clinics with several departments only)
+    narrows everything that is about APPOINTMENTS -- bookings, cancellations,
+    booked value, the schedule, and the service/doctor/specialty charts -- to
+    that department. Conversations can't be split by department (a chat
+    isn't tied to one until something is booked), so conversation numbers
+    and lists always cover the whole clinic. clinic_profile is the clinic's
+    row (clinic_type + departments) used to resolve each practitioner's
+    department.
     """
+    from shared import clinic_types
+    profile = clinic_profile or {}
+    multi = clinic_types.is_multi(profile)
+    dept_filter = None
+    if multi and department:
+        found = clinic_types.find_department(profile, department)
+        dept_filter = found["key"] if found else None
     cutoff = _period_cutoff(days)
     name_filter_norm = (name_filter or "").strip().lower() or None
     from_dt = _parse_date(date_from)
@@ -125,6 +143,18 @@ def get_dashboard_summary(
     schedule_dt = _parse_date(schedule_date) or datetime.now()
 
     with db() as conn:
+        # Practitioner -> department key (None for one-department clinics).
+        dentist_cols = {row["name"] for row in conn.execute("PRAGMA table_info(dentists)")}
+        dept_of_dentist: Dict[int, Optional[str]] = {}
+        if multi:
+            dept_col = "department" if "department" in dentist_cols else "NULL AS department"
+            for row in conn.execute(f"SELECT id, {dept_col} FROM dentists").fetchall():
+                found = clinic_types.find_department(profile, row["department"])
+                dept_of_dentist[row["id"]] = found["key"] if found else None
+
+        def _in_dept(dentist_id) -> bool:
+            return dept_filter is None or dept_of_dentist.get(dentist_id) == dept_filter
+
         # ---- Conversations in period (KPI + insight-chart scope) ----
         if cutoff:
             conv_rows = conn.execute(
@@ -148,7 +178,8 @@ def get_dashboard_summary(
             appt_rows = conn.execute(
                 "SELECT * FROM appointments WHERE created_at IS NOT NULL ORDER BY created_at DESC"
             ).fetchall()
-        appointments = [dict(r) for r in appt_rows]
+        all_appointments = [dict(r) for r in appt_rows]
+        appointments = [a for a in all_appointments if _in_dept(a["dentist_id"])]
         bookings_made = len(appointments)
         cancelled = len([a for a in appointments if a["status"] == "cancelled"])
 
@@ -196,7 +227,7 @@ def get_dashboard_summary(
         schedule_rows = conn.execute(
             """
             SELECT a.id, a.appointment_time, a.status, a.service_name, a.price_sar,
-                   a.reminder_sent_for, a.reminder_status,
+                   a.reminder_sent_for, a.reminder_status, a.dentist_id,
                    d.name as dentist_name, p.name as patient_name, p.phone_number,
                    p.age as patient_age, p.gender as patient_gender
             FROM appointments a
@@ -207,7 +238,15 @@ def get_dashboard_summary(
             """,
             (schedule_start, schedule_end),
         ).fetchall()
-        schedule_appointments = [dict(r) for r in schedule_rows]
+        schedule_appointments = []
+        dept_names = {d["key"]: d["name"] for d in clinic_types.departments(profile)} if multi else {}
+        for r in schedule_rows:
+            row = dict(r)
+            if not _in_dept(row["dentist_id"]):
+                continue
+            if multi:
+                row["department"] = dept_names.get(dept_of_dentist.get(row["dentist_id"]) or "", "")
+            schedule_appointments.append(row)
 
         # ---- Conversation outcomes -- booked / flagged / no booking, over
         # the FULL period (not capped), for the donut chart. Mirrors the
@@ -384,6 +423,17 @@ def get_dashboard_summary(
             {"specialization": spec, "count": count} for spec, count in specialty_counter.most_common(8)
         ]
 
+        # ---- Bookings by department (clinics with several departments):
+        # always across ALL departments, even when one is selected, so the
+        # chart keeps showing how the clinic's volume splits. ----
+        top_departments = []
+        if multi:
+            dept_counter = Counter(dept_of_dentist.get(a["dentist_id"]) for a in all_appointments)
+            top_departments = [
+                {"department": dept_names.get(key or "", key or "?"), "count": count}
+                for key, count in dept_counter.most_common(8)
+            ]
+
         # ---- Estimated revenue booked: sum of prices on non-cancelled
         # bookings in period. An estimate of pipeline value, NOT confirmed
         # or collected revenue -- it has no idea about no-shows or whether
@@ -418,6 +468,7 @@ def get_dashboard_summary(
         "top_services": top_services,
         "top_doctors": top_doctors,
         "top_specialties": top_specialties,
+        "top_departments": top_departments,
         "hourly_distribution": [{"hour": h, "message_count": hourly.get(h, 0)} for h in range(24)],
         "outcome_breakdown": {
             "booked": outcome_booked,
@@ -430,5 +481,6 @@ def get_dashboard_summary(
             "from": date_from if from_dt else "",
             "to": date_to if to_dt else "",
             "schedule_date": schedule_dt.strftime("%Y-%m-%d"),
+            "dept": dept_filter or "",
         },
     }
