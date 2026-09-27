@@ -35,6 +35,20 @@ class State(MessagesState):
     conversation_id: int | None = None
 
 
+def static_url_prefix(clinic: dict) -> str:
+    """Public URL prefix for this clinic's uploaded files (the offers brochure).
+    Clinics added through /admin/clinics keep them in data/clinics/<slug>/static,
+    served at /clinic-static/<slug>/static. The original clinic carried over from
+    the single-clinic days keeps them in the app's static/ folder, served at
+    /static -- sending it the /clinic-static link gave Meta a 404 and the
+    brochure never arrived."""
+    from shared import clinics_store
+    own_dir = os.path.abspath(os.path.join(clinics_store.DATA_ROOT, clinic["slug"], "static"))
+    if os.path.abspath(clinic.get("static_dir") or "") == own_dir:
+        return f"/clinic-static/{clinic['slug']}/static"
+    return "/static"
+
+
 class ClinicWorker:
     """
     Runs the whole message-handling pipeline for ONE clinic: its own MCP
@@ -64,7 +78,7 @@ class ClinicWorker:
             "META_PHONE_NUMBER_ID": clinic["whatsapp_phone_number_id"],
             "CLINIC_CONFIG_PATH": clinic["config_path"],
             "CLINIC_DB_PATH": clinic["db_path"],
-            "CLINIC_STATIC_URL_PREFIX": f"/clinic-static/{clinic['slug']}/static",
+            "CLINIC_STATIC_URL_PREFIX": static_url_prefix(clinic),
         })
 
         self.server_params = StdioServerParameters(
