@@ -346,6 +346,8 @@ CREATE TABLE IF NOT EXISTS appointments (
     created_at TEXT,
     service_name TEXT,
     price_sar REAL,
+    reminder_sent_for TEXT,
+    reminder_status TEXT,
     FOREIGN KEY(patient_id) REFERENCES patients(id),
     FOREIGN KEY(dentist_id) REFERENCES dentists(id)
 );
@@ -445,6 +447,17 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
         if "price_sar" not in existing_appt_columns:
             conn.execute("ALTER TABLE appointments ADD COLUMN price_sar REAL")
             logger.info("Migrated appointments table: added price_sar column.")
+        # Same-day WhatsApp reminders (see app/reminders.py).
+        # reminder_sent_for = the appointment_time a reminder was handled for,
+        # so a rescheduled appointment (same row, new time) gets a fresh one.
+        # reminder_status = 'sent_text' / 'sent_template' / 'skipped:<why>' /
+        # 'failed:<why>'.
+        if "reminder_sent_for" not in existing_appt_columns:
+            conn.execute("ALTER TABLE appointments ADD COLUMN reminder_sent_for TEXT")
+            logger.info("Migrated appointments table: added reminder_sent_for column.")
+        if "reminder_status" not in existing_appt_columns:
+            conn.execute("ALTER TABLE appointments ADD COLUMN reminder_status TEXT")
+            logger.info("Migrated appointments table: added reminder_status column.")
 
         if seed:
             existing = conn.execute("SELECT COUNT(*) FROM dentists").fetchone()[0]

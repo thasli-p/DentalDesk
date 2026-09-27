@@ -55,6 +55,7 @@ class ClinicWorker:
         self.clinic = clinic
         self.message_queue: asyncio.Queue = asyncio.Queue()
         self.agent = None
+        self.reminder_template_status = None
 
         clinic_dir = os.path.dirname(clinic["config_path"])
         server_env = os.environ.copy()
@@ -395,5 +396,8 @@ class ClinicWorker:
                 self.agent = await self.create_graph(session)
 
                 asyncio.create_task(self.conversation_cleanup_task())
+
+                from app.reminders import reminder_loop
+                asyncio.create_task(reminder_loop(self))
 
                 await self.consume_messages()

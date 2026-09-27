@@ -139,6 +139,10 @@ TRANSLATIONS = {
     "col_dentist": {"en": "Dentist", "ar": "الطبيب"},
     "col_service": {"en": "Service", "ar": "الخدمة"},
     "col_status": {"en": "Status", "ar": "الحالة"},
+    "col_reminder": {"en": "Reminder", "ar": "التذكير"},
+    "reminder_sent": {"en": "Sent", "ar": "أُرسل"},
+    "reminder_failed": {"en": "Failed", "ar": "فشل"},
+    "reminder_skipped": {"en": "Not needed", "ar": "غير مطلوب"},
     "col_age": {"en": "Age", "ar": "العمر"},
     "col_gender": {"en": "Gender", "ar": "الجنس"},
     "col_started": {"en": "Started", "ar": "بدأت"},
@@ -212,6 +216,19 @@ def _fmt_gender(value: Optional[str], lang: str) -> str:
     if entry:
         return entry.get(lang) or entry.get(DEFAULT_LANG)
     return html.escape(str(value))
+
+
+def _fmt_reminder(a: dict, lang: str) -> str:
+    """Same-day reminder state for a schedule row (see app/reminders.py).
+    Only counts if it was handled for the appointment's CURRENT time."""
+    status = a.get("reminder_status") or ""
+    if not status or a.get("reminder_sent_for") != a.get("appointment_time"):
+        return "—"
+    if status.startswith("sent"):
+        return "🔔 " + _t("reminder_sent", lang)
+    if status.startswith("failed"):
+        return f'<span class="badge badge-cancelled" title="{html.escape(status)}">{_t("reminder_failed", lang)}</span>'
+    return f'<span title="{html.escape(status)}">{_t("reminder_skipped", lang)}</span>'
 
 
 def _fmt_age(value) -> str:
@@ -600,14 +617,15 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
                 f'<td>{html.escape(a["phone_number"] or "")}</td>'
                 f'<td>{html.escape(a["dentist_name"] or "")}</td>'
                 f'<td>{html.escape(a["service_name"] or "—")}</td>'
-                f'<td>{badge}</td></tr>'
+                f'<td>{badge}</td>'
+                f'<td>{_fmt_reminder(a, lang)}</td></tr>'
             )
         schedule_html = (
             f'<table><tr><th>{_t("col_time", lang)}</th><th>{_t("col_patient", lang)}</th>'
             f'<th>{_t("col_age", lang)}</th><th>{_t("col_gender", lang)}</th>'
             f'<th>{_t("col_whatsapp", lang)}</th>'
             f'<th>{_t("col_dentist", lang)}</th><th>{_t("col_service", lang)}</th>'
-            f'<th>{_t("col_status", lang)}</th></tr>{rows}</table>'
+            f'<th>{_t("col_status", lang)}</th><th>{_t("col_reminder", lang)}</th></tr>{rows}</table>'
         )
     else:
         schedule_html = f'<div class="empty">{_t("schedule_empty", lang).format(date=_fmt_date_human(schedule_resolved))}</div>'

@@ -196,6 +196,7 @@ def get_dashboard_summary(
         schedule_rows = conn.execute(
             """
             SELECT a.id, a.appointment_time, a.status, a.service_name, a.price_sar,
+                   a.reminder_sent_for, a.reminder_status,
                    d.name as dentist_name, p.name as patient_name, p.phone_number,
                    p.age as patient_age, p.gender as patient_gender
             FROM appointments a
