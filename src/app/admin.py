@@ -177,7 +177,6 @@ PAGE_STYLE = """
   .check-label { display: flex; align-items: flex-start; gap: 8px; font-weight: 600; }
   .check-label input { margin-top: 3px; }
   .voice-number-form input[type=text] { width: 150px; padding: 4px 6px; font-size: 12px; margin-top: 6px; }
-  .voice-plan-form select { width: 190px; padding: 4px; font-size: 12px; margin-top: 6px; }
   .usage { margin-top: 6px; font-size: 12px; }
   .usage-bar { height: 6px; background: #eee; border-radius: 3px; margin: 3px 0; width: 190px; }
   .usage-bar div { height: 6px; border-radius: 3px; background: #1a7f37; }
@@ -193,18 +192,14 @@ RENEWAL_WARNING_DAYS = 30
 
 
 def _voice_plan_html(clinic: dict) -> str:
-    """Package picker + this month's minutes (warns at 80%, shows extra minutes
-    and the SAR to add to the invoice) + last month's amount to invoice."""
-    plan = clinics_store.voice_plan_of(clinic)
-    options = "".join(
-        f'<option value="{k}"{" selected" if k == plan["key"] else ""}>{v["label"]} ({v["minutes"]:,} min)</option>'
-        for k, v in clinics_store.VOICE_PLANS.items()
-    )
-    picker = (f'<form class="delete-form voice-plan-form" method="post" action="/admin/clinics/{clinic["id"]}/voice-plan">'
-              f'<select name="voice_plan">{options}</select>'
-              f'<button type="submit" class="small-btn">Save package</button></form>')
+    """Read-only: the clinic's package + this month's minutes (warns at 80%,
+    shows extra minutes and the SAR to add to the invoice) + last month's
+    amount to invoice. The package itself is chosen only when the clinic is
+    added -- this table is for monitoring, not for changing subscriptions."""
     if not clinic.get("voice_enabled"):
-        return picker
+        return ""
+    plan = clinics_store.voice_plan_of(clinic)
+    picker = f'<div class="hint">Package: <b>{plan["label"]}</b> ({plan["minutes"]:,} min)</div>'
     now = datetime.now()
     u = voice_usage.usage_summary(clinic, now.year, now.month)
     pct = min(100, round(u["fraction"] * 100))
@@ -264,10 +259,6 @@ def _render_page(message_html: str = "") -> str:
                 <td>{_days_left_html(c)}</td>
                 <td>
                     <span class="{'voice-on' if c['voice_enabled'] else 'voice-off'}">{'📞 On' if c['voice_enabled'] else 'Off'}</span>
-                    <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/voice">
-                        <input type="hidden" name="enabled" value="{'0' if c['voice_enabled'] else '1'}">
-                        <button type="submit" class="small-btn">{'Turn off' if c['voice_enabled'] else 'Turn on'}</button>
-                    </form>
                     <form class="delete-form voice-number-form" method="post" action="/admin/clinics/{c['id']}/voice-number">
                         <input type="text" name="voice_number" value="{('+' + html.escape(c['voice_number'])) if c.get('voice_number') else ''}" placeholder="Voice phone number">
                         <button type="submit" class="small-btn">Save number</button>
@@ -542,18 +533,6 @@ async def admin_add_clinic(
     return HTMLResponse(_render_page(message))
 
 
-@router.post("/admin/clinics/{clinic_id}/voice", response_class=HTMLResponse)
-async def admin_set_voice(clinic_id: int, enabled: str = Form("0"), _: bool = Depends(require_admin)):
-    clinic = clinics_store.get_clinic(clinic_id)
-    if not clinic:
-        return HTMLResponse(_render_page('<div class="flash-err">No clinic with that id. Nothing changed.</div>'))
-    on = enabled == "1"
-    clinics_store.set_voice_enabled(clinic_id, on)
-    state = "turned ON" if on else "turned OFF"
-    return HTMLResponse(_render_page(
-        f'<div class="flash-ok">📞 Voice call receptionist {state} for {html.escape(clinic["name"])}.</div>'))
-
-
 @router.post("/admin/clinics/{clinic_id}/voice-number", response_class=HTMLResponse)
 async def admin_set_voice_number(clinic_id: int, voice_number: str = Form(""), _: bool = Depends(require_admin)):
     clinic = clinics_store.get_clinic(clinic_id)
@@ -569,22 +548,10 @@ async def admin_set_voice_number(clinic_id: int, voice_number: str = Form(""), _
     if saved:
         msg = f'📞 Calls to +{saved} will now be answered as {html.escape(clinic["name"])}.'
         if not clinic["voice_enabled"]:
-            msg += ' Note: voice is still turned OFF for this clinic -- turn it on for calls to be answered.'
+            msg += ' Note: this clinic is not subscribed to voice calls, so calls to it will not be answered.'
     else:
         msg = f'Voice number removed for {html.escape(clinic["name"])}.'
     return HTMLResponse(_render_page(f'<div class="flash-ok">{msg}</div>'))
-
-
-@router.post("/admin/clinics/{clinic_id}/voice-plan", response_class=HTMLResponse)
-async def admin_set_voice_plan(clinic_id: int, voice_plan: str = Form(...), _: bool = Depends(require_admin)):
-    clinic = clinics_store.get_clinic(clinic_id)
-    if not clinic or voice_plan not in clinics_store.VOICE_PLANS:
-        return HTMLResponse(_render_page('<div class="flash-err">Unknown clinic or package. Nothing changed.</div>'))
-    clinics_store.set_voice_plan(clinic_id, voice_plan)
-    p = clinics_store.VOICE_PLANS[voice_plan]
-    return HTMLResponse(_render_page(
-        f'<div class="flash-ok">📞 {html.escape(clinic["name"])} is now on the {p["label"]} voice package '
-        f'({p["minutes"]:,} min per month).</div>'))
 
 
 @router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)
