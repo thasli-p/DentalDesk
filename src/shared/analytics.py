@@ -21,6 +21,7 @@ than guessed at; see the migration notes in shared/db.py.
 import logging
 from collections import Counter
 from datetime import datetime, timedelta
+import math
 from typing import Any, Dict, List, Optional
 
 from shared.db import db
@@ -78,12 +79,21 @@ def _booked_during(conn, patient_id: Optional[int], started_at: str, ended_at: O
     return row is not None
 
 
+def _duration_secs(c) -> Optional[int]:
+    """Length of a phone call (its conversation's start to end), in seconds."""
+    try:
+        return int((datetime.fromisoformat(c["ended_at"]) - datetime.fromisoformat(c["started_at"])).total_seconds())
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def get_dashboard_summary(
     days: Optional[int] = 7,
     name_filter: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     schedule_date: Optional[str] = None,
+    channel: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
@@ -332,6 +342,9 @@ def get_dashboard_summary(
         recent_conversations = []
         recent_truncated = False
         for c in list_conversations:
+            c_channel = c["channel"] if "channel" in c.keys() else "whatsapp"
+            if channel and c_channel != channel:
+                continue
             patient = _patient_lookup(c["patient_id"])
             if name_filter_norm and name_filter_norm not in patient["name"].lower():
                 continue
@@ -351,7 +364,8 @@ def get_dashboard_summary(
                 "message_count": list_message_count_by_conv.get(c["id"], 0),
                 "flagged": bool(c["flagged_for_staff"]),
                 "booked": booked,
-                "channel": c["channel"] if "channel" in c.keys() else "whatsapp",
+                "channel": c_channel,
+                "duration_secs": _duration_secs(c) if c_channel == "phone" else None,
             })
 
         # ---- Most-requested services (only reflects bookings made after
@@ -393,6 +407,9 @@ def get_dashboard_summary(
 
     conversion_rate = (bookings_made / total_conversations * 100) if total_conversations else 0.0
     escalation_rate = (len(flagged) / total_conversations * 100) if total_conversations else 0.0
+    phone_calls = [c for c in conversations if (c.get("channel") or "whatsapp") == "phone"]
+    # Same counting as the voice package billing: per started minute, calls under 10 s free.
+    phone_minutes = sum(math.ceil(d / 60) for d in (_duration_secs(c) for c in phone_calls) if d and d >= 10)
 
     return {
         "period_days": days,
@@ -409,6 +426,9 @@ def get_dashboard_summary(
             "escalation_rate_pct": round(escalation_rate, 1),
             "avg_messages_per_conversation": round(avg_messages, 1),
             "estimated_revenue_booked_sar": estimated_revenue,
+            "phone_calls": len(phone_calls),
+            "phone_minutes": phone_minutes,
+            "whatsapp_conversations": total_conversations - len(phone_calls),
         },
         "schedule_date": schedule_dt.strftime("%Y-%m-%d"),
         "schedule_appointments": schedule_appointments,

@@ -22,7 +22,9 @@ Meta's 24-hour rule
     `ensure_reminder_template()` submits that template to each clinic's
     WABA automatically at startup (Meta reviews it, usually within minutes
     to a few hours). Until it's approved, template reminders fail and are
-    logged as `failed:...` on the appointment (they aren't retried).
+    logged as `failed:...` on the appointment. While the template is still in
+    Meta's review (or Meta has a temporary problem) the reminder is NOT marked
+    failed: it's retried every pass until 15 minutes before the appointment.
 
 Each appointment row records what happened in `reminder_status`
 (sent_text / sent_template / skipped:<why> / failed:<why>), keyed by
@@ -266,6 +268,39 @@ def ensure_reminder_template(clinic: dict) -> str:
         return f"error:{e}"
 
 
+# Meta errors that mean "the template can't be used right now" (still in
+# review, missing translation, paused) or a temporary problem on Meta's side.
+# Those reminders are retried on the next pass instead of being marked failed.
+RETRYABLE_META_CODES = {132001, 132015, 132016, 131000, 131016, 130429, 80007}
+
+
+def _retryable(r: requests.Response) -> bool:
+    if r.status_code >= 500 or r.status_code == 429:
+        return True
+    try:
+        return int(r.json().get("error", {}).get("code", 0)) in RETRYABLE_META_CODES
+    except ValueError:
+        return False
+
+
+def template_ready(worker) -> bool:
+    """True once the reminder template is APPROVED for this clinic. While it
+    isn't, the status is looked up again (at most every 10 minutes), so
+    reminders start by themselves as soon as Meta approves it."""
+    status = getattr(worker, "reminder_template_status", None)
+    if status == "APPROVED":
+        return True
+    last = getattr(worker, "_template_checked_at", None)
+    if last and datetime.now() - last < timedelta(minutes=10):
+        return False
+    worker._template_checked_at = datetime.now()
+    status = ensure_reminder_template(worker.clinic)
+    if status != getattr(worker, "reminder_template_status", None):
+        logger.info(f"[{worker.clinic['slug']}] Reminder template '{_template_name()}' ({_template_lang()}): {status}")
+    worker.reminder_template_status = status
+    return status == "APPROVED"
+
+
 # ---------------------------------------------------------------------------
 # One pass + the loop
 # ---------------------------------------------------------------------------
@@ -296,8 +331,26 @@ def run_once(worker, now: Optional[datetime] = None) -> list:
                 worker.send(to, reminder_text(params))
                 status = "sent_text"
             else:
+                if not template_ready(worker):
+                    # Template still in Meta review (or paused): don't burn this
+                    # reminder -- leave it unmarked so the next pass retries,
+                    # until it is too close to the appointment (decide()).
+                    logger.info(f"[{clinic['slug']}] Reminder for appointment {appt['id']} waiting: "
+                                f"template status {getattr(worker, 'reminder_template_status', None)}")
+                    continue
                 r = send_template(clinic, to, params)
-                status = "sent_template" if r.ok else f"failed:{r.status_code} {r.text[:150]}"
+                if r.ok:
+                    status = "sent_template"
+                elif _retryable(r):
+                    worker.reminder_template_status = None  # re-check the template on the next pass
+                    logger.warning(f"[{clinic['slug']}] Reminder for appointment {appt['id']} will retry: "
+                                   f"{r.status_code} {r.text[:150]}")
+                    continue
+                else:
+                    status = f"failed:{r.status_code} {r.text[:150]}"
+        except requests.RequestException as e:
+            logger.warning(f"[{clinic['slug']}] Reminder for appointment {appt['id']} will retry: {e}")
+            continue
         except Exception as e:  # never let one patient break the loop
             status = f"failed:{e}"[:200]
 

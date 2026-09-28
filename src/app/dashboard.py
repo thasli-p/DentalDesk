@@ -44,7 +44,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from shared import clinics_store, db, analytics
+from shared import clinics_store, db, analytics, voice_usage
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,13 @@ TRANSLATIONS = {
     "h2_schedule": {"en": "Schedule", "ar": "الجدول"},
     "h2_needs_attention": {"en": "Needs attention", "ar": "بحاجة لمتابعة"},
     "h2_recent": {"en": "Recent conversations", "ar": "المحادثات الأخيرة"},
+    "kpi_phone_calls": {"en": "📞 Phone calls", "ar": "📞 المكالمات"},
+    "kpi_phone_minutes": {"en": "📞 Call minutes", "ar": "📞 دقائق المكالمات"},
+    "kpi_voice_month": {"en": "📞 Voice minutes this month", "ar": "📞 دقائق الاتصال هذا الشهر"},
+    "tab_all": {"en": "All", "ar": "الكل"},
+    "tab_whatsapp": {"en": "💬 WhatsApp", "ar": "💬 واتساب"},
+    "tab_calls": {"en": "📞 Phone calls", "ar": "📞 المكالمات"},
+    "col_msgs_or_duration": {"en": "Messages / call length", "ar": "الرسائل / مدة المكالمة"},
     "h2_services": {"en": "Most requested services", "ar": "الخدمات الأكثر طلبًا"},
     "h2_doctors": {"en": "Bookings by doctor", "ar": "الحجوزات حسب الطبيب"},
     "h2_specialties": {"en": "Bookings by specialty", "ar": "الحجوزات حسب التخصص"},
@@ -538,7 +545,15 @@ def _svg_donut_chart(slices, *, size: int = 160, thickness: int = 26) -> str:
     return f'<div class="donut-wrap"><div>{svg}</div><div class="legend">{"".join(legend_items)}</div></div>'
 
 
-def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "", lang: str = DEFAULT_LANG) -> str:
+def _fmt_duration(secs) -> str:
+    if secs is None:
+        return ""
+    secs = max(0, int(secs))
+    return f"{secs // 60}m {secs % 60:02d}s"
+
+
+def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "", lang: str = DEFAULT_LANG,
+                 channel: str = "") -> str:
     lang = lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
     dir_attr = "rtl" if lang == "ar" else "ltr"
 
@@ -570,6 +585,15 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
         (kpis["avg_messages_per_conversation"], _t("kpi_avg_messages", lang)),
         (_fmt_money(kpis["estimated_revenue_booked_sar"]), _t("kpi_est_revenue", lang)),
     ]
+    # Phone calls get their own cards (for clinics on the voice tier, or any
+    # clinic that has received calls), so calls aren't lost among the chats.
+    if clinic.get("voice_enabled") or kpis.get("phone_calls"):
+        kpi_cards.insert(1, (kpis.get("phone_calls", 0), _t("kpi_phone_calls", lang)))
+        kpi_cards.insert(2, (kpis.get("phone_minutes", 0), _t("kpi_phone_minutes", lang)))
+    if clinic.get("voice_enabled"):
+        now = datetime.now()
+        usage = voice_usage.usage_summary(clinic, now.year, now.month)
+        kpi_cards.append((f'{usage["minutes"]:,} / {usage["included"]:,}', _t("kpi_voice_month", lang)))
     kpi_html = "".join(
         f'<div class="kpi-card"><div class="kpi-value">{html.escape(str(v))}</div>'
         f'<div class="kpi-label">{html.escape(label)}</div></div>'
@@ -678,6 +702,13 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     else:
         attention_html = f'<div class="empty">{_t("attention_empty", lang)}</div>'
 
+    # All / WhatsApp / Phone calls tabs for the conversations list
+    channel_tabs_html = '<div class="periods channel-tabs">' + "".join(
+        f'<a class="{"active" if channel == value else ""}" '
+        f'href="?days={days_param}{filter_qs}{("&ch=" + value) if value else ""}#recent">{_t(key, lang)}</a>'
+        for value, key in (("", "tab_all"), ("whatsapp", "tab_whatsapp"), ("phone", "tab_calls"))
+    ) + '</div>'
+
     # Recent conversations feed
     if data["recent_conversations"]:
         rows = ""
@@ -695,14 +726,14 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
                 f'<td>{_fmt_age(c["patient_age"])}</td>'
                 f'<td>{_fmt_gender(c["patient_gender"], lang)}</td>'
                 f'<td>{html.escape(c["phone_number"] or "")}</td>'
-                f'<td>{c["message_count"]}</td>'
+                f'<td>{_fmt_duration(c.get("duration_secs")) if c.get("channel") == "phone" else c["message_count"]}</td>'
                 f'<td>{booked_badge}</td>'
                 f'<td><a class="view-link" href="{conv_url}">{_t("view", lang)}</a></td></tr>'
             )
         recent_html = (
             f'<table><tr><th>{_t("col_started", lang)}</th><th>{_t("col_patient", lang)}</th>'
             f'<th>{_t("col_age", lang)}</th><th>{_t("col_gender", lang)}</th>'
-            f'<th>{_t("col_whatsapp", lang)}</th><th>{_t("col_messages", lang)}</th>'
+            f'<th>{_t("col_whatsapp", lang)}</th><th>{_t("col_msgs_or_duration", lang)}</th>'
             f'<th>{_t("col_outcome", lang)}</th><th></th></tr>{rows}</table>'
         )
         if data.get("recent_conversations_truncated"):
@@ -801,7 +832,8 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
   <h2>{_t('h2_needs_attention', lang)} ({len(data['needs_attention'])})</h2>
   {attention_html}
 
-  <h2>{_t('h2_recent', lang)}</h2>
+  <h2 id="recent">{_t('h2_recent', lang)}</h2>
+  {channel_tabs_html}
   {recent_html}
 
   <h2>{_t('h2_services', lang)}</h2>
@@ -958,17 +990,19 @@ async def clinic_dashboard(
     date_to: Optional[str] = Query(None, alias="to"),
     sched: Optional[str] = Query(None),
     lang: str = Query(DEFAULT_LANG),
+    ch: Optional[str] = Query(None),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
     db.set_current_db_path(clinic["db_path"])
+    channel = ch if ch in ("phone", "whatsapp") else ""
     data = analytics.get_dashboard_summary(
         days=_days_param(days), name_filter=name, date_from=date_from, date_to=date_to,
-        schedule_date=sched,
+        schedule_date=sched, channel=channel or None,
     )
-    return HTMLResponse(_render_page(clinic, data, days, sched or "", lang))
+    return HTMLResponse(_render_page(clinic, data, days, sched or "", lang, channel))
 
 
 @router.get("/clinic/{slug}/api/dashboard")
