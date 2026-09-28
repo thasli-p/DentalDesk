@@ -214,19 +214,20 @@ def get_clinic_by_voice_number(number: Optional[str]) -> Optional[Dict[str, Any]
         return _row_to_dict(row) if row else None
 
 
-# Voice-call packages sold on top of the WhatsApp subscription. The clinic
-# picks only the package (Quiet / Average / Busy); the monthly price follows
-# the length of its WhatsApp subscription (1 / 3 / 6 months, same discounts as
-# WhatsApp: 2,200 / 2,000 / 1,700 -> about -9% / -23%). 12-month clinics get the 6-month price,
-# trial clinics the 1-month price. Extra minutes beyond the allowance cost the
-# same whatever the term. Prices in SAR per month.
+# Voice-call packages sold on top of the WhatsApp subscription. Sales picks
+# only the package (Quiet / Average / Busy); the monthly price follows the
+# length of the clinic's WhatsApp subscription. Quiet is the benchmark set by
+# Ziad: 1,500 / 1,300 / 1,200 SAR a month for 1 / 3 / 6 months (-13% / -20%);
+# Average and Busy use the same term discounts. 12-month clinics get the
+# 6-month price, trial clinics the 1-month price. Extra minutes cost the same
+# whatever the term and are never cheaper than the package's own rate.
 VOICE_PLANS = {
-    "quiet":   {"label": "Quiet",   "minutes": 720,  "overage_sar": 1.75,
-                "price_sar": {"1_month": 1200, "3_months": 1100, "6_months": 950}},
-    "average": {"label": "Average", "minutes": 1500, "overage_sar": 1.50,
-                "price_sar": {"1_month": 2000, "3_months": 1800, "6_months": 1550}},
-    "busy":    {"label": "Busy",    "minutes": 3000, "overage_sar": 1.25,
-                "price_sar": {"1_month": 3500, "3_months": 3200, "6_months": 2700}},
+    "quiet":   {"label": "Quiet",   "minutes": 720,  "overage_sar": 2.25,
+                "price_sar": {"1_month": 1500, "3_months": 1300, "6_months": 1200}},
+    "average": {"label": "Average", "minutes": 1500, "overage_sar": 1.75,
+                "price_sar": {"1_month": 2500, "3_months": 2150, "6_months": 2000}},
+    "busy":    {"label": "Busy",    "minutes": 3000, "overage_sar": 1.50,
+                "price_sar": {"1_month": 4000, "3_months": 3450, "6_months": 3200}},
 }
 VOICE_TERM_FOR_SUBSCRIPTION = {
     "trial": "1_month", "1_month": "1_month", "3_months": "3_months",
