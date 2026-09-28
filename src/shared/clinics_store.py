@@ -214,13 +214,23 @@ def get_clinic_by_voice_number(number: Optional[str]) -> Optional[Dict[str, Any]
         return _row_to_dict(row) if row else None
 
 
-# Voice-call packages sold on top of the WhatsApp subscription. Prices in SAR
-# per month; extra minutes beyond the allowance are billed at overage_sar
-# each. Edit here to change what clinics are offered and invoiced.
+# Voice-call packages sold on top of the WhatsApp subscription. The clinic
+# picks only the package (Quiet / Average / Busy); the monthly price follows
+# the length of its WhatsApp subscription (1 / 3 / 6 months, same discounts as
+# WhatsApp: 2,200 / 2,000 / 1,700 -> about -9% / -23%). 12-month clinics get the 6-month price,
+# trial clinics the 1-month price. Extra minutes beyond the allowance cost the
+# same whatever the term. Prices in SAR per month.
 VOICE_PLANS = {
-    "quiet":   {"label": "Quiet",   "minutes": 720,  "price_sar": 1200, "overage_sar": 1.75},
-    "average": {"label": "Average", "minutes": 1500, "price_sar": 2000, "overage_sar": 1.50},
-    "busy":    {"label": "Busy",    "minutes": 3000, "price_sar": 3500, "overage_sar": 1.25},
+    "quiet":   {"label": "Quiet",   "minutes": 720,  "overage_sar": 1.75,
+                "price_sar": {"1_month": 1200, "3_months": 1100, "6_months": 950}},
+    "average": {"label": "Average", "minutes": 1500, "overage_sar": 1.50,
+                "price_sar": {"1_month": 2000, "3_months": 1800, "6_months": 1550}},
+    "busy":    {"label": "Busy",    "minutes": 3000, "overage_sar": 1.25,
+                "price_sar": {"1_month": 3500, "3_months": 3200, "6_months": 2700}},
+}
+VOICE_TERM_FOR_SUBSCRIPTION = {
+    "trial": "1_month", "1_month": "1_month", "3_months": "3_months",
+    "6_months": "6_months", "12_months": "6_months",
 }
 DEFAULT_VOICE_PLAN = "quiet"
 
@@ -234,7 +244,10 @@ def voice_plan_of(clinic: Dict[str, Any], year: Optional[int] = None, month: Opt
     if year and month and clinic.get("voice_plan_prev") and changed[:7] > f"{year:04d}-{month:02d}":
         key = clinic["voice_plan_prev"]
     key = key if key in VOICE_PLANS else DEFAULT_VOICE_PLAN
-    return {"key": key, **VOICE_PLANS[key]}
+    term = VOICE_TERM_FOR_SUBSCRIPTION.get(clinic.get("subscription_plan") or "", "1_month")
+    plan = VOICE_PLANS[key]
+    return {"key": key, "term": term, "label": plan["label"], "minutes": plan["minutes"],
+            "overage_sar": plan["overage_sar"], "price_sar": plan["price_sar"][term]}
 
 
 def set_voice_plan(clinic_id: int, plan: str):

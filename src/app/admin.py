@@ -185,7 +185,6 @@ PAGE_STYLE = """
   .usage-over .usage-bar div { background: #cf222e; }
   .usage-warn { color: #9a5b00; }
   .usage-over { color: #cf222e; }
-  .plans-table td, .plans-table th { font-size: 13px; }
 </style>
 """
 
@@ -193,24 +192,12 @@ PAGE_STYLE = """
 RENEWAL_WARNING_DAYS = 30
 
 
-def _voice_plans_table_html() -> str:
-    rows = "".join(
-        f'<tr><td><b>{v["label"]}</b></td><td>{v["minutes"]:,} min</td><td>SAR {v["price_sar"]:,}</td>'
-        f'<td>SAR {v["overage_sar"]:.2f} / min</td><td>SAR {v["price_sar"] / v["minutes"]:.2f} / min</td></tr>'
-        for v in clinics_store.VOICE_PLANS.values()
-    )
-    return (f'<table class="plans-table"><tr><th>Package</th><th>Included per month</th><th>Price</th>'
-            f'<th>Extra minutes</th><th>Effective rate</th></tr>{rows}</table>'
-            f'<p class="hint">Minutes are counted per calendar month, per started minute; calls under '
-            f'{voice_usage.MIN_BILLABLE_SECONDS} seconds are free. Unused minutes don\'t roll over.</p>')
-
-
 def _voice_plan_html(clinic: dict) -> str:
     """Package picker + this month's minutes (warns at 80%, shows extra minutes
     and the SAR to add to the invoice) + last month's amount to invoice."""
     plan = clinics_store.voice_plan_of(clinic)
     options = "".join(
-        f'<option value="{k}"{" selected" if k == plan["key"] else ""}>{v["label"]} — {v["minutes"]} min / SAR {v["price_sar"]:,}</option>'
+        f'<option value="{k}"{" selected" if k == plan["key"] else ""}>{v["label"]} ({v["minutes"]:,} min)</option>'
         for k, v in clinics_store.VOICE_PLANS.items()
     )
     picker = (f'<form class="delete-form voice-plan-form" method="post" action="/admin/clinics/{clinic["id"]}/voice-plan">'
@@ -313,9 +300,6 @@ def _render_page(message_html: str = "") -> str:
 <body>
   <div class="brand-row"><img src="/static/logo.png" alt="Mawaid"><h1>🦷 Mawaid — Clinics running on this service</h1></div>
   {message_html}
-
-  <h2>Voice call packages</h2>
-  {_voice_plans_table_html()}
 
   <h2>Current clinics</h2>
   {_renewal_summary_html(clinics)}
@@ -433,7 +417,8 @@ def _render_page(message_html: str = "") -> str:
     </label>
 
     <label>Voice package
-      <select name="voice_plan">{"".join(f'<option value="{k}">{v["label"]} — {v["minutes"]} min / SAR {v["price_sar"]:,} per month</option>' for k, v in clinics_store.VOICE_PLANS.items())}</select>
+      <span class="hint">Only pick the size -- the price follows the WhatsApp subscription length chosen above.</span>
+      <select name="voice_plan">{"".join(f'<option value="{k}">{v["label"]} ({v["minutes"]:,} min per month)</option>' for k, v in clinics_store.VOICE_PLANS.items())}</select>
     </label>
 
     <label>Voice phone number (optional)
@@ -599,7 +584,7 @@ async def admin_set_voice_plan(clinic_id: int, voice_plan: str = Form(...), _: b
     p = clinics_store.VOICE_PLANS[voice_plan]
     return HTMLResponse(_render_page(
         f'<div class="flash-ok">📞 {html.escape(clinic["name"])} is now on the {p["label"]} voice package '
-        f'({p["minutes"]} min for SAR {p["price_sar"]:,}/month, extra minutes SAR {p["overage_sar"]:.2f}).</div>'))
+        f'({p["minutes"]:,} min per month).</div>'))
 
 
 @router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)
