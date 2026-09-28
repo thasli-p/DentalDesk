@@ -36,7 +36,7 @@ from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from shared import clinics_store
+from shared import clinics_store, voice_usage
 from app.clinic_registry import launch_clinic_worker, stop_clinic_worker
 
 logger = logging.getLogger(__name__)
@@ -177,11 +177,66 @@ PAGE_STYLE = """
   .check-label { display: flex; align-items: flex-start; gap: 8px; font-weight: 600; }
   .check-label input { margin-top: 3px; }
   .voice-number-form input[type=text] { width: 150px; padding: 4px 6px; font-size: 12px; margin-top: 6px; }
+  .voice-plan-form select { width: 190px; padding: 4px; font-size: 12px; margin-top: 6px; }
+  .usage { margin-top: 6px; font-size: 12px; }
+  .usage-bar { height: 6px; background: #eee; border-radius: 3px; margin: 3px 0; width: 190px; }
+  .usage-bar div { height: 6px; border-radius: 3px; background: #1a7f37; }
+  .usage-warn .usage-bar div { background: #d4881a; }
+  .usage-over .usage-bar div { background: #cf222e; }
+  .usage-warn { color: #9a5b00; }
+  .usage-over { color: #cf222e; }
+  .plans-table td, .plans-table th { font-size: 13px; }
 </style>
 """
 
 
 RENEWAL_WARNING_DAYS = 30
+
+
+def _voice_plans_table_html() -> str:
+    rows = "".join(
+        f'<tr><td><b>{v["label"]}</b></td><td>{v["minutes"]:,} min</td><td>SAR {v["price_sar"]:,}</td>'
+        f'<td>SAR {v["overage_sar"]:.2f} / min</td><td>SAR {v["price_sar"] / v["minutes"]:.2f} / min</td></tr>'
+        for v in clinics_store.VOICE_PLANS.values()
+    )
+    return (f'<table class="plans-table"><tr><th>Package</th><th>Included per month</th><th>Price</th>'
+            f'<th>Extra minutes</th><th>Effective rate</th></tr>{rows}</table>'
+            f'<p class="hint">Minutes are counted per calendar month, per started minute; calls under '
+            f'{voice_usage.MIN_BILLABLE_SECONDS} seconds are free. Unused minutes don\'t roll over.</p>')
+
+
+def _voice_plan_html(clinic: dict) -> str:
+    """Package picker + this month's minutes (warns at 80%, shows extra minutes
+    and the SAR to add to the invoice) + last month's amount to invoice."""
+    plan = clinics_store.voice_plan_of(clinic)
+    options = "".join(
+        f'<option value="{k}"{" selected" if k == plan["key"] else ""}>{v["label"]} — {v["minutes"]} min / SAR {v["price_sar"]:,}</option>'
+        for k, v in clinics_store.VOICE_PLANS.items()
+    )
+    picker = (f'<form class="delete-form voice-plan-form" method="post" action="/admin/clinics/{clinic["id"]}/voice-plan">'
+              f'<select name="voice_plan">{options}</select>'
+              f'<button type="submit" class="small-btn">Save package</button></form>')
+    if not clinic.get("voice_enabled"):
+        return picker
+    now = datetime.now()
+    u = voice_usage.usage_summary(clinic, now.year, now.month)
+    pct = min(100, round(u["fraction"] * 100))
+    if u["extra_minutes"]:
+        cls, note = "usage-over", (f'⛔ {u["extra_minutes"]} extra min × SAR {plan["overage_sar"]:.2f} '
+                                   f'= <b>SAR {u["extra_sar"]:,.2f}</b> to add')
+    elif u["fraction"] >= voice_usage.WARN_AT_FRACTION:
+        cls, note = "usage-warn", f'⚠️ {u["included"] - u["minutes"]} min left this month'
+    else:
+        cls, note = "usage-ok", f'{u["included"] - u["minutes"]} min left'
+    py, pm = voice_usage.previous_month(now)
+    last = voice_usage.usage_summary(clinic, py, pm)
+    last_extra = f' (incl. SAR {last["extra_sar"]:,.2f} extra)' if last["extra_minutes"] else ""
+    last_html = (f'<span class="hint">{datetime(py, pm, 1).strftime("%b %Y")}: {last["minutes"]} min, '
+                 f'invoice SAR {last["total_sar"]:,.2f}{last_extra}</span>')
+    return (picker +
+            f'<div class="usage {cls}"><b>{now.strftime("%b")}: {u["minutes"]} / {u["included"]} min</b> '
+            f'<span class="hint">({u["calls"]} calls)</span>'
+            f'<div class="usage-bar"><div style="width:{pct}%"></div></div>{note}</div>{last_html}')
 
 
 def _days_left_html(clinic: dict) -> str:
@@ -230,6 +285,7 @@ def _render_page(message_html: str = "") -> str:
                         <input type="text" name="voice_number" value="{('+' + html.escape(c['voice_number'])) if c.get('voice_number') else ''}" placeholder="Voice phone number">
                         <button type="submit" class="small-btn">Save number</button>
                     </form>
+                    {_voice_plan_html(c)}
                 </td>
                 <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
                 <td>
@@ -257,6 +313,9 @@ def _render_page(message_html: str = "") -> str:
 <body>
   <div class="brand-row"><img src="/static/logo.png" alt="Mawaid"><h1>🦷 Mawaid — Clinics running on this service</h1></div>
   {message_html}
+
+  <h2>Voice call packages</h2>
+  {_voice_plans_table_html()}
 
   <h2>Current clinics</h2>
   {_renewal_summary_html(clinics)}
@@ -373,6 +432,10 @@ def _render_page(message_html: str = "") -> str:
         Its phone line still needs to be connected to the voice agent (see voice-receptionist notes).</span></span>
     </label>
 
+    <label>Voice package
+      <select name="voice_plan">{"".join(f'<option value="{k}">{v["label"]} — {v["minutes"]} min / SAR {v["price_sar"]:,} per month</option>' for k, v in clinics_store.VOICE_PLANS.items())}</select>
+    </label>
+
     <label>Voice phone number (optional)
       <span class="hint">The number patients call to reach this clinic's AI receptionist (the number bought from the
       SIP provider and added in ElevenLabs), e.g. +966 11 234 5678. Calls to this number are answered with this
@@ -411,6 +474,7 @@ async def admin_add_clinic(
     subscription_started_at: str = Form(""),
     voice_enabled: str = Form(""),
     voice_number: str = Form(""),
+    voice_plan: str = Form(clinics_store.DEFAULT_VOICE_PLAN),
     offers_image: Optional[UploadFile] = File(None),
 ):
     if voice_number.strip():
@@ -445,6 +509,7 @@ async def admin_add_clinic(
         subscription_plan=subscription_plan,
         subscription_started_at=subscription_started_at or None,
         voice_enabled=voice_enabled == "1",
+        voice_plan=voice_plan,
     )
     if voice_number.strip():
         clinic["voice_number"] = clinics_store.set_voice_number(clinic["id"], voice_number)
@@ -523,6 +588,18 @@ async def admin_set_voice_number(clinic_id: int, voice_number: str = Form(""), _
     else:
         msg = f'Voice number removed for {html.escape(clinic["name"])}.'
     return HTMLResponse(_render_page(f'<div class="flash-ok">{msg}</div>'))
+
+
+@router.post("/admin/clinics/{clinic_id}/voice-plan", response_class=HTMLResponse)
+async def admin_set_voice_plan(clinic_id: int, voice_plan: str = Form(...), _: bool = Depends(require_admin)):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic or voice_plan not in clinics_store.VOICE_PLANS:
+        return HTMLResponse(_render_page('<div class="flash-err">Unknown clinic or package. Nothing changed.</div>'))
+    clinics_store.set_voice_plan(clinic_id, voice_plan)
+    p = clinics_store.VOICE_PLANS[voice_plan]
+    return HTMLResponse(_render_page(
+        f'<div class="flash-ok">📞 {html.escape(clinic["name"])} is now on the {p["label"]} voice package '
+        f'({p["minutes"]} min for SAR {p["price_sar"]:,}/month, extra minutes SAR {p["overage_sar"]:.2f}).</div>'))
 
 
 @router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)

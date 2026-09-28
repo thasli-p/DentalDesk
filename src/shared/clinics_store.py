@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS clinics (
     dashboard_password TEXT,
     voice_enabled INTEGER NOT NULL DEFAULT 0,
     voice_number TEXT,
+    voice_plan TEXT NOT NULL DEFAULT 'quiet',
+    voice_plan_prev TEXT,
+    voice_plan_changed_at TEXT,
 
     db_path TEXT NOT NULL,
     config_path TEXT NOT NULL,
@@ -125,6 +128,12 @@ def init_control_db():
         if "voice_number" not in existing_columns:
             conn.execute("ALTER TABLE clinics ADD COLUMN voice_number TEXT")
             logger.info("Migrated clinics table: added voice_number column.")
+        if "voice_plan" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN voice_plan TEXT NOT NULL DEFAULT 'quiet'")
+            logger.info("Migrated clinics table: added voice_plan column.")
+        for col in ("voice_plan_prev", "voice_plan_changed_at"):
+            if col not in existing_columns:
+                conn.execute(f"ALTER TABLE clinics ADD COLUMN {col} TEXT")
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -203,6 +212,46 @@ def get_clinic_by_voice_number(number: Optional[str]) -> Optional[Dict[str, Any]
     with _db() as conn:
         row = conn.execute("SELECT * FROM clinics WHERE voice_number=?", (normalized,)).fetchone()
         return _row_to_dict(row) if row else None
+
+
+# Voice-call packages sold on top of the WhatsApp subscription. Prices in SAR
+# per month; extra minutes beyond the allowance are billed at overage_sar
+# each. Edit here to change what clinics are offered and invoiced.
+VOICE_PLANS = {
+    "quiet":   {"label": "Quiet",   "minutes": 720,  "price_sar": 1200, "overage_sar": 1.75},
+    "average": {"label": "Average", "minutes": 1500, "price_sar": 2000, "overage_sar": 1.50},
+    "busy":    {"label": "Busy",    "minutes": 3000, "price_sar": 3500, "overage_sar": 1.25},
+}
+DEFAULT_VOICE_PLAN = "quiet"
+
+
+def voice_plan_of(clinic: Dict[str, Any], year: Optional[int] = None, month: Optional[int] = None) -> Dict[str, Any]:
+    """The clinic's voice package -- for a given month if asked. A package
+    change applies from the month it was made, so earlier months keep being
+    invoiced on the package they were actually on."""
+    key = clinic.get("voice_plan")
+    changed = clinic.get("voice_plan_changed_at") or ""
+    if year and month and clinic.get("voice_plan_prev") and changed[:7] > f"{year:04d}-{month:02d}":
+        key = clinic["voice_plan_prev"]
+    key = key if key in VOICE_PLANS else DEFAULT_VOICE_PLAN
+    return {"key": key, **VOICE_PLANS[key]}
+
+
+def set_voice_plan(clinic_id: int, plan: str):
+    if plan not in VOICE_PLANS:
+        raise ValueError(f"Unknown voice plan: {plan}")
+    clinic = get_clinic(clinic_id)
+    if not clinic or clinic.get("voice_plan") == plan:
+        return
+    this_month = datetime.now().strftime("%Y-%m")
+    changed = clinic.get("voice_plan_changed_at") or ""
+    # Several changes within the same month: keep the package it started the month on.
+    prev = clinic.get("voice_plan_prev") if changed[:7] == this_month else clinic.get("voice_plan")
+    with _db() as conn:
+        conn.execute(
+            "UPDATE clinics SET voice_plan=?, voice_plan_prev=?, voice_plan_changed_at=? WHERE id=?",
+            (plan, prev, datetime.now().strftime("%Y-%m-%d"), clinic_id),
+        )
 
 
 def set_voice_enabled(clinic_id: int, enabled: bool):
@@ -316,6 +365,7 @@ def add_clinic(
     subscription_plan: str = "trial",
     subscription_started_at: Optional[str] = None,
     voice_enabled: bool = False,
+    voice_plan: str = DEFAULT_VOICE_PLAN,
 ) -> Dict[str, Any]:
     """Adds a new clinic and creates its own private data folder
     (data/clinics/<slug>/) for its database, config file, and uploaded
@@ -342,9 +392,9 @@ def add_clinic(
                 general_hours, parking, phone, address, google_maps_link,
                 offers_text, offers_image_filename,
                 holidays_json, services_json, dentists_json,
-                subscription_plan, subscription_started_at, dashboard_password, voice_enabled,
+                subscription_plan, subscription_started_at, dashboard_password, voice_enabled, voice_plan,
                 db_path, config_path, static_dir, created_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug, name,
@@ -353,6 +403,7 @@ def add_clinic(
                 offers_text, offers_image_filename,
                 json.dumps(holidays or []), json.dumps(services or []), json.dumps(dentists or []),
                 subscription_plan, started_at, dashboard_password, 1 if voice_enabled else 0,
+                voice_plan if voice_plan in VOICE_PLANS else DEFAULT_VOICE_PLAN,
                 db_path, config_path, static_dir, datetime.now().isoformat(),
             ),
         )
