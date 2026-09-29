@@ -405,6 +405,8 @@ PAGE_STYLE = """
   .reply-box .reply-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
   .reply-box .window-note { font-size: 12px; color: #666; }
   .reply-box button { padding: 8px 18px; border: none; border-radius: 6px; background: #1a7f37; color: white; font-size: 14px; cursor: pointer; }
+  .reply-box .reply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .reply-box button.handback-btn { background: #fff; color: #0b3a75; border: 1px solid #0b3a75; }
   .reply-closed { background: #f7f7f7; border-radius: 8px; padding: 12px 14px; margin-top: 16px; font-size: 13px; color: #555; }
   .flash { border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
   .flash.ok { background: #e6ffed; color: #1a7f37; }
@@ -998,6 +1000,9 @@ def _render_inbox_bar(clinic: dict, conversation, inbox: dict, lang: str, qs: st
     if inbox["paused"]:
         text = _t("inbox_staff_active", lang).format(time=inbox["paused"]["until"].strftime("%H:%M"))
         action, label, cls = "handback", _t("inbox_hand_back", lang), "staff"
+        if inbox["can_reply"]:
+            # The Return to Sia button sits next to Send in the reply box.
+            return f'<div class="inbox-bar {cls}"><span>{html.escape(text)}</span></div>'
     else:
         text, action, label, cls = _t("inbox_sia_active", lang), "takeover", _t("inbox_take_over", lang), "sia"
     return (
@@ -1065,7 +1070,10 @@ def _render_conversation_page(
     <textarea name="text" id="reply-text" maxlength="4000" placeholder="{_t('inbox_reply_placeholder', lang)}" dir="auto"></textarea>
     <div class="reply-row">
       <span class="window-note">{_t('inbox_window_left', lang).format(left=_fmt_left(left, lang))}</span>
-      <button type="submit">{_t('inbox_send', lang)}</button>
+      <span class="reply-actions">
+        <button type="submit" class="handback-btn" id="handback-btn" formaction="{base}/handback?{page_qs}"{'' if inbox["paused"] else ' style="display:none"'}>{_t('inbox_hand_back', lang)}</button>
+        <button type="submit">{_t('inbox_send', lang)}</button>
+      </span>
     </div>
   </form>"""
     elif inbox["blocked"] == "window_closed":
@@ -1102,6 +1110,8 @@ def _render_conversation_page(
           bar.innerHTML = d.bar_html;
           bar.setAttribute("data-state", d.bar_state);
         }}
+        var hb = document.getElementById("handback-btn");
+        if (hb) hb.style.display = d.bar_state === "staff" ? "" : "none";
       }})
       .catch(function () {{}});
   }}
