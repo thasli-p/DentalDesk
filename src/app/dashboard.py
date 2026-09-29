@@ -252,6 +252,14 @@ TRANSLATIONS = {
     },
     "inbox_err_expired": {"en": "The page was out of date — please try again.", "ar": "انتهت صلاحية الصفحة — حاول مرة أخرى."},
     "hours_short": {"en": "{h} h {m} min", "ar": "{h} س {m} د"},
+    # Sound alerts
+    "sound_on": {"en": "🔔 Sound on", "ar": "🔔 الصوت مفعّل"},
+    "sound_off": {"en": "🔕 Sound off", "ar": "🔕 الصوت متوقف"},
+    "sound_blocked": {"en": "🔔 Click to allow sound", "ar": "🔔 اضغط للسماح بالصوت"},
+    "alert_flag": {"en": "Needs attention: {name}", "ar": "بحاجة لمتابعة: {name}"},
+    "alert_msg": {"en": "New message from {name}", "ar": "رسالة جديدة من {name}"},
+    "alert_open": {"en": "Open", "ar": "فتح"},
+    "alert_dismiss": {"en": "Dismiss", "ar": "إخفاء"},
 }
 
 # Small, fixed vocabulary (not free text like a name), so it's translated
@@ -408,6 +416,13 @@ PAGE_STYLE = """
   .reply-box .reply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .reply-box button.handback-btn { background: #fff; color: #0b3a75; border: 1px solid #0b3a75; }
   .reply-closed { background: #f7f7f7; border-radius: 8px; padding: 12px 14px; margin-top: 16px; font-size: 13px; color: #555; }
+  .sound-toggle { position: fixed; bottom: 16px; inset-inline-start: 16px; z-index: 50; padding: 7px 14px; border-radius: 18px; border: 1px solid #ccc; background: #fff; font-size: 13px; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+  .sound-toggle.blocked { border-color: #f0d78c; background: #fff8e6; }
+  #alerts { position: fixed; bottom: 16px; inset-inline-end: 16px; z-index: 60; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
+  .alert-toast { background: #fff; border: 1px solid #f0d78c; border-inline-start: 5px solid #fab219; border-radius: 8px; padding: 10px 12px; font-size: 13px; box-shadow: 0 3px 12px rgba(0,0,0,.15); display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+  .alert-toast.msg { border-color: #b5cff3; border-inline-start-color: #2a78d6; }
+  .alert-toast a { color: #1a7f37; font-weight: 600; text-decoration: none; white-space: nowrap; }
+  .alert-toast button { border: none; background: none; color: #999; cursor: pointer; font-size: 16px; }
   .flash { border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
   .flash.ok { background: #e6ffed; color: #1a7f37; }
   .flash.err { background: #ffeef0; color: #cf222e; }
@@ -622,6 +637,170 @@ def _fmt_duration(secs) -> str:
         return ""
     secs = max(0, int(secs))
     return f"{secs // 60}m {secs % 60:02d}s"
+
+
+def _alerts_widget(clinic: dict, lang: str, soft_refresh: bool = False) -> str:
+    """Sound + pop-up alerts, on every dashboard page. Polls /api/alerts
+    every 10 s and chimes when (a) Sia flags a chat for staff, or (b) a
+    patient writes in a chat staff have taken over (Sia is paused there,
+    so nobody else will answer). Sia's normal chats never chime.
+
+    Browsers only allow sound after someone has clicked the page, and a
+    full page reload takes that permission away again -- so the main
+    dashboard (soft_refresh=True) refreshes its contents in place every
+    30 s instead of reloading, which keeps the sound working all day.
+    What has already been alerted is remembered per browser tab, so moving
+    between pages doesn't chime again for the same thing."""
+    labels = {k: _t(k, lang) for k in (
+        "sound_on", "sound_off", "sound_blocked", "alert_flag", "alert_msg", "alert_open", "alert_dismiss")}
+    cfg = {
+        "slug": clinic["slug"],
+        "alertsUrl": f'/clinic/{clinic["slug"]}/api/alerts',
+        "convBase": f'/clinic/{clinic["slug"]}/dashboard/conversation/',
+        "lang": lang,
+        "softRefresh": soft_refresh,
+        "t": labels,
+    }
+    return f"""
+<button type="button" class="sound-toggle" id="sound-toggle">{labels['sound_on']}</button>
+<div id="alerts"></div>
+<script>
+(function () {{
+  var C = {json.dumps(cfg, ensure_ascii=False)};
+  var PREF = "mawaid_sound", SEEN = "mawaid_seen_" + C.slug;
+  var ctx = null, baseTitle = document.title;
+  function soundOn() {{ try {{ return localStorage.getItem(PREF) !== "off"; }} catch (e) {{ return true; }} }}
+  function getCtx() {{
+    if (!ctx) {{ var A = window.AudioContext || window.webkitAudioContext; if (A) ctx = new A(); }}
+    return ctx;
+  }}
+  function label() {{
+    var b = document.getElementById("sound-toggle"); if (!b) return;
+    var blocked = soundOn() && (!getCtx() || ctx.state !== "running");
+    b.textContent = !soundOn() ? C.t.sound_off : (blocked ? C.t.sound_blocked : C.t.sound_on);
+    b.className = "sound-toggle" + (blocked ? " blocked" : "");
+  }}
+  function unlock() {{ var c = getCtx(); if (c && c.state !== "running") c.resume().then(label, label); else label(); }}
+  document.addEventListener("click", unlock, true);
+  document.addEventListener("keydown", unlock, true);
+  document.getElementById("sound-toggle").addEventListener("click", function (e) {{
+    e.stopPropagation(); unlock();
+    try {{ localStorage.setItem(PREF, soundOn() ? "off" : "on"); }} catch (err) {{}}
+    label(); if (soundOn()) chime();
+  }});
+  function tone(c, f, start, dur) {{
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = "sine"; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.25, start + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    o.connect(g); g.connect(c.destination); o.start(start); o.stop(start + dur + 0.05);
+  }}
+  function chime() {{
+    if (!soundOn()) return;
+    var c = getCtx(); if (!c || c.state !== "running") return;
+    var t = c.currentTime; tone(c, 880, t, 0.35); tone(c, 1318.5, t + 0.18, 0.5);
+  }}
+  function esc(s) {{ return String(s || "").replace(/[&<>"]/g, function (ch) {{ return {{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[ch]; }}); }}
+  function toast(kind, text, convId) {{
+    var box = document.getElementById("alerts");
+    var el = document.createElement("div");
+    el.className = "alert-toast " + kind;
+    el.innerHTML = "<span>" + esc(text) + "</span><span><a href='" + C.convBase + convId + "?lang=" + C.lang + "'>" +
+      esc(C.t.alert_open) + "</a> <button type='button' title='" + esc(C.t.alert_dismiss) + "'>×</button></span>";
+    el.querySelector("button").onclick = function () {{ el.remove(); }};
+    box.prepend(el);
+    while (box.children.length > 4) box.lastChild.remove();
+    document.title = "🔔 " + baseTitle;
+  }}
+  window.addEventListener("focus", function () {{ document.title = baseTitle; }});
+  function loadSeen() {{ try {{ return JSON.parse(sessionStorage.getItem(SEEN)); }} catch (e) {{ return null; }} }}
+  function saveSeen(v) {{ try {{ sessionStorage.setItem(SEEN, JSON.stringify(v)); }} catch (e) {{}} }}
+  function poll() {{
+    fetch(C.alertsUrl, {{credentials: "same-origin", cache: "no-store"}})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (d) {{
+        if (!d) return;
+        var seen = loadSeen(), first = !seen;
+        seen = seen || {{flags: {{}}, msg: 0}};
+        var ring = false;
+        d.flags.forEach(function (f) {{
+          var key = String(f.conversation_id);
+          if (seen.flags[key] !== f.sig) {{
+            if (!first) {{ toast("flag", C.t.alert_flag.replace("{{name}}", f.name), f.conversation_id); ring = true; }}
+            seen.flags[key] = f.sig;
+          }}
+        }});
+        d.messages.forEach(function (m) {{
+          if (m.id > seen.msg && !first) {{ toast("msg", C.t.alert_msg.replace("{{name}}", m.name), m.conversation_id); ring = true; }}
+        }});
+        if (d.max_message_id > seen.msg) seen.msg = d.max_message_id;
+        saveSeen(seen);
+        if (ring) chime();
+      }})
+      .catch(function () {{}});
+  }}
+  label(); poll(); setInterval(poll, 10000);
+  if (C.softRefresh) {{
+    setInterval(function () {{
+      var a = document.activeElement;
+      if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+      fetch(location.href, {{credentials: "same-origin", cache: "no-store"}})
+        .then(function (r) {{ return r.ok ? r.text() : null; }})
+        .then(function (h) {{
+          if (!h) return;
+          var doc = new DOMParser().parseFromString(h, "text/html");
+          var fresh = doc.getElementById("page"), cur = document.getElementById("page");
+          if (fresh && cur) cur.innerHTML = fresh.innerHTML;
+        }})
+        .catch(function () {{}});
+    }}, 30000);
+  }}
+}})();
+</script>"""
+
+
+@router.get("/clinic/{slug}/api/alerts")
+async def clinic_alerts(slug: str, credentials: HTTPBasicCredentials = Depends(security)):
+    """What the sound alerts poll: chats Sia flagged in the last 2 days, and
+    patient messages from the last day in chats staff have taken over.
+    Each flag has a 'sig' that changes when Sia adds another reason, so a
+    second flag on the same chat alerts again."""
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+    db.set_current_db_path(clinic["db_path"])
+    now = datetime.now()
+    flags, messages, max_id = [], [], 0
+    with db.db() as conn:
+        for r in conn.execute(
+            """
+            SELECT c.id, LENGTH(COALESCE(c.flag_reason, '')) AS len, p.name
+            FROM conversations c LEFT JOIN patients p ON p.id = c.patient_id
+            WHERE c.flagged_for_staff = 1 AND c.started_at >= ?
+            ORDER BY c.id DESC LIMIT 30
+            """,
+            ((now - timedelta(days=2)).isoformat(),),
+        ).fetchall():
+            flags.append({"conversation_id": r["id"], "sig": r["len"], "name": r["name"] or _t("unknown_patient", DEFAULT_LANG)})
+        row = conn.execute("SELECT MAX(id) AS m FROM messages").fetchone()
+        max_id = (row["m"] if row else 0) or 0
+        try:
+            rows = conn.execute(
+                """
+                SELECT m.id, m.conversation_id, p.name
+                FROM messages m
+                JOIN conversations c ON c.id = m.conversation_id
+                JOIN patients p ON p.id = c.patient_id
+                WHERE m.sender = 'user' AND p.ai_paused_until > ? AND m.created_at >= ?
+                ORDER BY m.id DESC LIMIT 30
+                """,
+                (now.isoformat(timespec="seconds"), (now - timedelta(days=1)).isoformat()),
+            ).fetchall()
+        except Exception:  # database not migrated yet (no ai_paused_until column)
+            rows = []
+        for r in rows:
+            messages.append({"id": r["id"], "conversation_id": r["conversation_id"], "name": r["name"] or ""})
+    return {"flags": flags, "messages": messages, "max_message_id": max_id}
 
 
 def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "", lang: str = DEFAULT_LANG,
@@ -876,11 +1055,12 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
 <html lang="{lang}" dir="{dir_attr}">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="30">
+  <noscript><meta http-equiv="refresh" content="30"></noscript>
   <title>{html.escape(clinic['name'])} — {_t('dashboard_title', lang)}</title>
   {PAGE_STYLE}
 </head>
 <body>
+<div id="page">
   <div class="header-row">
     <div class="brand-row"><img src="{LOGO_URL}" alt="Mawaid"><h1>{html.escape(clinic['name'])} — {_t('dashboard_title', lang)}</h1></div>
     <a class="lang-toggle" href="{lang_toggle_url}">{_t('lang_toggle', lang)}</a>
@@ -926,6 +1106,8 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     {_t('api_hint', lang)}
     <code>/clinic/{html.escape(clinic['slug'])}/api/dashboard?days={days_param}</code> {_t('api_hint_suffix', lang)}.
   </div>
+</div>
+{_alerts_widget(clinic, lang, soft_refresh=True)}
 </body>
 </html>"""
 
@@ -1156,6 +1338,7 @@ def _render_conversation_page(
   <div class="transcript" id="transcript">{transcript_html}</div>
   {reply_html}
   {live_js}
+  {_alerts_widget(clinic, lang)}
 </body>
 </html>"""
 
