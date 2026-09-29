@@ -314,6 +314,94 @@ def get_last_message_for_patient(patient_id: int) -> Optional[Message]:
 
 
 # -----------------------
+# Shared inbox (staff takeover) -- see app/handoff.py
+# -----------------------
+def get_ai_pause(patient_id: int, now: Optional[datetime] = None) -> Optional[dict]:
+    """{"until": datetime, "by": str} if Sia is currently paused for this
+    patient (staff are handling the chat), else None. An expired pause
+    counts as not paused -- that's the automatic hand-back to Sia."""
+    now = now or datetime.now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT ai_paused_until, ai_paused_by FROM patients WHERE id=?", (patient_id,)
+        ).fetchone()
+    if not row or not row["ai_paused_until"]:
+        return None
+    try:
+        until = datetime.fromisoformat(row["ai_paused_until"])
+    except ValueError:
+        return None
+    if until <= now:
+        return None
+    return {"until": until, "by": row["ai_paused_by"] or ""}
+
+
+def pause_ai(patient_id: int, until: datetime, by: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE patients SET ai_paused_until=?, ai_paused_by=? WHERE id=?",
+            (until.isoformat(timespec="seconds"), by, patient_id),
+        )
+    logger.info("Sia paused for patient %s until %s (by %s)", patient_id, until, by)
+
+
+def resume_ai(patient_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE patients SET ai_paused_until=NULL, ai_paused_by=NULL WHERE id=?", (patient_id,)
+        )
+    logger.info("Sia resumed for patient %s", patient_id)
+
+
+def last_inbound_whatsapp_at(phone_number: str) -> Optional[datetime]:
+    """When this number last sent the clinic a WhatsApp message (phone
+    calls don't count). Meta only allows free-text replies within 24 h of
+    this -- after that, only approved templates."""
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT MAX(m.created_at) AS last_in
+            FROM messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            JOIN patients p ON p.id = c.patient_id
+            WHERE p.phone_number = ? AND m.sender = 'user'
+              AND COALESCE(c.channel, 'whatsapp') = 'whatsapp'
+            """,
+            (phone_number,),
+        ).fetchone()
+    if not row or not row["last_in"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["last_in"])
+    except ValueError:
+        return None
+
+
+def get_latest_whatsapp_conversation(patient_id: int) -> Optional[Conversation]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM conversations
+            WHERE patient_id=? AND COALESCE(channel, 'whatsapp') = 'whatsapp'
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """,
+            (patient_id,),
+        ).fetchone()
+        return Conversation(**dict(row)) if row else None
+
+
+def reopen_conversation(conversation_id: int) -> None:
+    """Staff replied in a chat that had already timed out -- open it again
+    so the patient's answer lands in the same thread, not a new one."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE conversations SET status='open', ended_at=NULL, closed_reason=NULL WHERE id=?",
+            (conversation_id,),
+        )
+
+
+# -----------------------
 # DB Initialization
 # -----------------------
 SCHEMA_SQL = """
@@ -458,6 +546,17 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
         if "reminder_status" not in existing_appt_columns:
             conn.execute("ALTER TABLE appointments ADD COLUMN reminder_status TEXT")
             logger.info("Migrated appointments table: added reminder_status column.")
+        # Shared inbox (see app/handoff.py): while clinic staff are handling
+        # a patient's WhatsApp chat themselves, Sia stays quiet for that
+        # number until ai_paused_until passes or staff press "Return to Sia".
+        # Stored per patient (not per conversation) so the pause survives a
+        # conversation being closed/reopened mid-chat.
+        if "ai_paused_until" not in existing_patient_columns:
+            conn.execute("ALTER TABLE patients ADD COLUMN ai_paused_until TEXT")
+            logger.info("Migrated patients table: added ai_paused_until column.")
+        if "ai_paused_by" not in existing_patient_columns:
+            conn.execute("ALTER TABLE patients ADD COLUMN ai_paused_by TEXT")
+            logger.info("Migrated patients table: added ai_paused_by column.")
 
         if seed:
             existing = conn.execute("SELECT COUNT(*) FROM dentists").fetchone()[0]

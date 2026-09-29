@@ -185,7 +185,7 @@ def get_dashboard_summary(
             placeholders = ",".join("?" for _ in conv_ids)
             msg_rows = conn.execute(
                 f"SELECT conversation_id, created_at FROM messages WHERE conversation_id IN ({placeholders}) "
-                f"AND sender IN ('user','agent')",
+                f"AND sender IN ('user','agent','staff')",
                 conv_ids,
             ).fetchall()
             for m in msg_rows:
@@ -297,7 +297,7 @@ def get_dashboard_summary(
             placeholders = ",".join("?" for _ in list_conv_ids)
             for row in conn.execute(
                 f"SELECT conversation_id, COUNT(*) as cnt FROM messages "
-                f"WHERE conversation_id IN ({placeholders}) AND sender IN ('user','agent') "
+                f"WHERE conversation_id IN ({placeholders}) AND sender IN ('user','agent','staff') "
                 f"GROUP BY conversation_id",
                 list_conv_ids,
             ).fetchall():
@@ -309,16 +309,17 @@ def get_dashboard_summary(
             coming in (age/gender) without a separate query per row."""
             if patient_id is None:
                 return {"name": "Unknown", "phone_number": None, "age": None, "gender": None}
-            row = conn.execute(
-                "SELECT name, phone_number, age, gender FROM patients WHERE id=?", (patient_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM patients WHERE id=?", (patient_id,)).fetchone()
             if not row:
                 return {"name": "Unknown", "phone_number": None, "age": None, "gender": None}
+            paused_until = row["ai_paused_until"] if "ai_paused_until" in row.keys() else None
             return {
                 "name": row["name"] or "Unknown",
                 "phone_number": row["phone_number"],
                 "age": row["age"],
                 "gender": row["gender"],
+                # Staff are handling this number's chat right now (Sia paused)
+                "staff_handling": bool(paused_until and paused_until > datetime.now().isoformat(timespec="seconds")),
             }
 
         needs_attention = []
@@ -363,6 +364,7 @@ def get_dashboard_summary(
                 "status": c["status"],
                 "message_count": list_message_count_by_conv.get(c["id"], 0),
                 "flagged": bool(c["flagged_for_staff"]),
+                "staff_handling": patient.get("staff_handling", False),
                 "booked": booked,
                 "channel": c_channel,
                 "duration_secs": _duration_secs(c) if c_channel == "phone" else None,

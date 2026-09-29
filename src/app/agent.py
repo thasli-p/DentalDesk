@@ -163,6 +163,17 @@ class ClinicWorker:
                             "want to cancel/reschedule or book something clashing): " + "; ".join(upcoming)
                         )
 
+            staff_marker = "[Reply sent by clinic staff, not Sia]"
+            if any(isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.startswith(staff_marker)
+                   for m in state["messages"]):
+                patient_context += (
+                    "\n\nSHARED INBOX: messages in this chat that start with \"[Reply sent by clinic "
+                    "staff, not Sia]\" were written by a member of the clinic's staff, who handled the "
+                    "chat for a while. The patient saw them as coming from the clinic. Treat what staff "
+                    "said as the clinic's position: don't contradict or repeat it, and never start your "
+                    "own replies with that marker. If the patient wrote several messages while staff "
+                    "were handling the chat, answer what is still open."
+                )
             final_system_prompt = systemPrompt[0].content + patient_context
             sys_msg = SystemMessage(content=final_system_prompt)
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
@@ -202,6 +213,12 @@ class ClinicWorker:
         """
         logger.debug(f"[{self.clinic['slug']}] Enqueueing message from {patient_phone}")
 
+        # This runs inside the webhook request, not the worker's own task,
+        # so point db.* at THIS clinic's database explicitly. (Before this,
+        # the patient/conversation rows for any clinic other than the
+        # original one were created in the default database file.)
+        db.set_current_db_path(self.clinic["db_path"])
+
         patient = db.get_patient_by_phone(patient_phone)
         if not patient:
             patient = db.create_patient(Patient(name="New Patient", phone_number=patient_phone))
@@ -209,6 +226,13 @@ class ClinicWorker:
         conversation = db.get_open_conversation(patient.id)
         if not conversation:
             conversation = db.create_conversation(patient.id)
+
+        # Shared inbox: staff are handling this chat themselves, so save the
+        # message for the dashboard but don't hand it to Sia.
+        if db.get_ai_pause(patient.id):
+            db.add_message(conversation_id=conversation.id, sender="user", message=message)
+            logger.info(f"[{self.clinic['slug']}] Sia paused for patient {patient.id} (staff handling) -- saved message to conversation {conversation.id} without replying.")
+            return
 
         logger.info(f"[{self.clinic['slug']}] Enqueuing message for patient {patient.id} in conversation {conversation.id}")
 
@@ -238,6 +262,12 @@ class ClinicWorker:
                 message = task["message"]
                 patient_phone_for_reply = patient.phone_number
 
+                # Staff may have taken over while this message was queued.
+                if db.get_ai_pause(patient.id):
+                    db.add_message(conversation_id=conversation_id, sender="user", message=message)
+                    logger.info(f"[{self.clinic['slug']}] Staff took over conversation {conversation_id} while a message was queued -- saved it without replying.")
+                    continue
+
                 config = {"configurable": {"thread_id": str(conversation_id)}}
 
                 current_state = await agent.aget_state(config)
@@ -253,6 +283,11 @@ class ClinicWorker:
                                 history_messages.append(HumanMessage(content=msg.message))
                             elif msg.sender == 'agent':
                                 history_messages.append(AIMessage(content=msg.message))
+                            elif msg.sender == 'staff':
+                                # A reply clinic staff sent by hand from the
+                                # dashboard (see app/handoff.py). Shown to Sia
+                                # as part of the clinic's side of the chat.
+                                history_messages.append(AIMessage(content=f"[Reply sent by clinic staff, not Sia] {msg.message}"))
                             elif msg.sender == 'agent_tool_call':
                                 tool_calls = json.loads(msg.message)
                                 history_messages.append(AIMessage(content="", tool_calls=tool_calls))
@@ -288,6 +323,8 @@ class ClinicWorker:
                             # whenever a tool call was present -- never sent,
                             # and missing from the dashboard transcript.
                             reply_text = extract_reply_text(msg.content) if msg.content else ""
+                            # Never let Sia echo the staff-reply marker she sees in her history.
+                            reply_text = reply_text.replace("[Reply sent by clinic staff, not Sia]", "").strip()
                             if reply_text:
                                 db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
                                 self.send(patient_phone_for_reply, reply_text)
