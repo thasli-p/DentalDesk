@@ -34,17 +34,21 @@ for later).
 import os
 import math
 import html
+import hmac
+import json
+import hashlib
 import logging
 import secrets as _secrets
 from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from shared import clinics_store, db, analytics, voice_usage
+from app import handoff
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +170,7 @@ TRANSLATIONS = {
         "ar": "يُصفّي هذا \"بحاجة لمتابعة\" و\"المحادثات الأخيرة\" أدناه. اجعل \"من\" و\"إلى\" بنفس التاريخ ليوم واحد. البحث بالاسم بدون تاريخ يبحث في كامل سجل هذه العيادة، وليس فقط ضمن الفترة المحددة أعلاه.",
     },
     "no_number": {"en": "no number", "ar": "بدون رقم"},
-    "view_conversation": {"en": "View conversation", "ar": "عرض المحادثة"},
+    "view_conversation": {"en": "Open chat", "ar": "فتح المحادثة"},
     "view": {"en": "View", "ar": "عرض"},
     "attention_empty_filtered": {"en": "Nothing flagged matches this filter.", "ar": "لا يوجد ما يطابق هذا التصفية."},
     "attention_empty": {"en": "Nothing flagged right now.", "ar": "لا يوجد ما يحتاج للمتابعة حاليًا."},
@@ -199,6 +203,55 @@ TRANSLATIONS = {
     "badge_no_booking": {"en": "no booking", "ar": "بدون حجز"},
     "unknown_patient": {"en": "Unknown", "ar": "غير معروف"},
     "unknown_patient_title": {"en": "Unknown patient", "ar": "مريض غير معروف"},
+    # Shared inbox (app/handoff.py)
+    "staff_name": {"en": "Clinic staff", "ar": "موظف العيادة"},
+    "badge_staff": {"en": "staff replying", "ar": "يرد الموظف"},
+    "inbox_sia_active": {"en": "Sia is answering this chat.", "ar": "سيا ترد على هذه المحادثة."},
+    "inbox_staff_active": {
+        "en": "Staff are handling this chat — Sia is paused until {time}, then takes over again automatically.",
+        "ar": "الموظفون يتولّون هذه المحادثة — سيا متوقفة حتى {time} ثم تعود للرد تلقائيًا.",
+    },
+    "inbox_take_over": {"en": "Take over", "ar": "تولَّ المحادثة"},
+    "inbox_hand_back": {"en": "Return to Sia", "ar": "أعِد المحادثة لسيا"},
+    "inbox_reply_placeholder": {
+        "en": "Type a reply to the patient… (sending it pauses Sia for this chat)",
+        "ar": "اكتب ردًا للمريض… (الإرسال يوقف سيا في هذه المحادثة)",
+    },
+    "inbox_send": {"en": "Send on WhatsApp", "ar": "إرسال عبر واتساب"},
+    "inbox_window_left": {
+        "en": "You can reply for another {left} (WhatsApp allows replies up to 24 hours after the patient's last message).",
+        "ar": "يمكنك الرد خلال {left} المتبقية (يسمح واتساب بالرد خلال 24 ساعة من آخر رسالة من المريض).",
+    },
+    "inbox_window_closed": {
+        "en": "More than 24 hours since the patient last wrote, so WhatsApp won't deliver a normal reply. Call the patient, or wait for them to message again.",
+        "ar": "مرّ أكثر من 24 ساعة على آخر رسالة من المريض، لذلك لن يوصل واتساب ردًا عاديًا. اتصل بالمريض أو انتظر حتى يراسل مجددًا.",
+    },
+    "inbox_not_latest": {
+        "en": "This patient has a newer conversation — reply there.",
+        "ar": "لدى هذا المريض محادثة أحدث — قم بالرد هناك.",
+    },
+    "inbox_open_latest": {"en": "Open the latest conversation", "ar": "افتح أحدث محادثة"},
+    "inbox_phone_note": {
+        "en": "This was a phone call — replies can only be sent in a WhatsApp chat.",
+        "ar": "هذه مكالمة هاتفية — لا يمكن الرد إلا في محادثة واتساب.",
+    },
+    "inbox_ok_sent": {"en": "Sent. Sia is paused for this chat.", "ar": "تم الإرسال. سيا متوقفة في هذه المحادثة."},
+    "inbox_ok_taken": {"en": "You're handling this chat. Sia is paused.", "ar": "أنت تتولى هذه المحادثة الآن. سيا متوقفة."},
+    "inbox_ok_returned": {"en": "Sia will answer this patient's next message.", "ar": "سترد سيا على الرسالة القادمة من هذا المريض."},
+    "inbox_err_empty": {"en": "Type a message first.", "ar": "اكتب رسالة أولًا."},
+    "inbox_err_too_long": {"en": "That message is too long for WhatsApp.", "ar": "الرسالة أطول من المسموح في واتساب."},
+    "inbox_err_window_closed": {
+        "en": "Not sent: more than 24 hours since the patient's last message.",
+        "ar": "لم تُرسل: مرّ أكثر من 24 ساعة على آخر رسالة من المريض.",
+    },
+    "inbox_err_not_latest": {"en": "Not sent: reply in the patient's latest conversation.", "ar": "لم تُرسل: قم بالرد في أحدث محادثة للمريض."},
+    "inbox_err_not_whatsapp": {"en": "Not sent: this isn't a WhatsApp chat.", "ar": "لم تُرسل: هذه ليست محادثة واتساب."},
+    "inbox_err_send_failed": {
+        "en": "WhatsApp didn't accept the message. Try again; if it keeps failing, check the clinic's WhatsApp connection.",
+        "ar": "لم يقبل واتساب الرسالة. حاول مجددًا، وإذا تكرر الخطأ تحقق من ربط واتساب الخاص بالعيادة.",
+    },
+    "inbox_err_expired": {"en": "The page was out of date — please try again.", "ar": "انتهت صلاحية الصفحة — حاول مرة أخرى."},
+    "hours_short": {"en": "{h} h {m} min", "ar": "{h} س {m} د"},
 }
 
 # Small, fixed vocabulary (not free text like a name), so it's translated
@@ -319,6 +372,7 @@ PAGE_STYLE = """
   .badge-no { background: #f0f0f0; color: #999; }
   .badge-flag { background: #fff3cd; color: #8a6300; }
   .badge-cancelled { background: #ffeef0; color: #cf222e; }
+  .badge-staff { background: #e8f1fd; color: #0b3a75; }
   .empty { color: #999; font-size: 13px; padding: 10px 0; }
   .bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin: 2px 0; }
   .bar-hour { width: 34px; color: #666; text-align: end; }
@@ -338,7 +392,23 @@ PAGE_STYLE = """
   .bubble { max-width: 65%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
   .bubble-row.patient .bubble { background: #f0f0f0; color: #1a1a1a; }
   .bubble-row.sia .bubble { background: #dcf3e3; color: #14532d; }
+  .bubble-row.staff { justify-content: flex-end; }
+  .bubble-row.staff .bubble { background: #dbe9fb; color: #0b3a75; }
   .bubble-time { font-size: 10px; color: #999; margin-top: 3px; }
+  .inbox-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; border-radius: 8px; padding: 10px 14px; margin: 10px 0 14px 0; font-size: 13px; }
+  .inbox-bar.sia { background: #e6ffed; border: 1px solid #b7e4c4; color: #14532d; }
+  .inbox-bar.staff { background: #e8f1fd; border: 1px solid #b5cff3; color: #0b3a75; }
+  .inbox-bar form { margin: 0; }
+  .inbox-bar button { padding: 6px 14px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; background: #fff; border: 1px solid currentColor; color: inherit; }
+  .reply-box { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #ddd; padding: 12px 0 16px 0; margin-top: 16px; }
+  .reply-box textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font: inherit; font-size: 14px; resize: vertical; }
+  .reply-box .reply-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+  .reply-box .window-note { font-size: 12px; color: #666; }
+  .reply-box button { padding: 8px 18px; border: none; border-radius: 6px; background: #1a7f37; color: white; font-size: 14px; cursor: pointer; }
+  .reply-closed { background: #f7f7f7; border-radius: 8px; padding: 12px 14px; margin-top: 16px; font-size: 13px; color: #555; }
+  .flash { border-radius: 6px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
+  .flash.ok { background: #e6ffed; color: #1a7f37; }
+  .flash.err { background: #ffeef0; color: #cf222e; }
   .view-link { font-size: 12px; }
   .chart-wrap { margin: 10px 0 20px 0; direction: ltr; }
   .donut-wrap { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; margin: 10px 0 20px 0; }
@@ -713,7 +783,9 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     if data["recent_conversations"]:
         rows = ""
         for c in data["recent_conversations"]:
-            if c["flagged"]:
+            if c.get("staff_handling") and c.get("channel", "whatsapp") == "whatsapp":
+                booked_badge = f'<span class="badge badge-staff">{_t("badge_staff", lang)}</span>'
+            elif c["flagged"]:
                 booked_badge = f'<span class="badge badge-flag">{_t("badge_flagged", lang)}</span>'
             elif c["booked"]:
                 booked_badge = f'<span class="badge badge-yes">{_t("badge_booked", lang)}</span>'
@@ -856,20 +928,104 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
 </html>"""
 
 
+def _render_transcript(messages: list, patient, is_phone: bool, lang: str) -> str:
+    """The human-readable half of a conversation as chat bubbles. Tool
+    rows ("tool"/"agent_tool_call") are Sia's internal lookups and are left
+    out. Staff replies sent from this dashboard sit on the clinic's side,
+    in blue, labelled as staff."""
+    visible = [m for m in messages if m.sender in ("user", "agent", "staff")]
+    if not visible:
+        return f'<div class="empty">{_t("no_messages", lang)}</div>'
+    agent_name = _t("voice_agent_name", lang) if is_phone else "Sia"
+    out = ""
+    for m in visible:
+        if m.sender == "user":
+            side, speaker = "patient", (patient.name if patient else "Patient")
+        elif m.sender == "staff":
+            side, speaker = "staff", _t("staff_name", lang)
+        else:
+            side, speaker = "sia", agent_name
+        out += (
+            f'<div class="bubble-row {side}"><div>'
+            f'<div class="bubble">{html.escape(m.message)}</div>'
+            f'<div class="bubble-time">{html.escape(speaker)} · {_fmt_dt(str(m.created_at))}</div>'
+            f'</div></div>'
+        )
+    return out
+
+
+def _fmt_left(delta: timedelta, lang: str) -> str:
+    mins = max(0, int(delta.total_seconds() // 60))
+    return _t("hours_short", lang).format(h=mins // 60, m=mins % 60)
+
+
+def _inbox_token(clinic: dict, conversation_id: int) -> str:
+    """Per-conversation form token. The dashboard uses HTTP Basic auth,
+    which the browser re-sends automatically -- so without this, another
+    website could post a reply "as" a logged-in receptionist."""
+    secret = (os.environ.get("META_APP_SECRET") or os.environ.get("ADMIN_PASSWORD") or "mawaid").encode()
+    return hmac.new(secret, f"inbox:{clinic['slug']}:{conversation_id}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _inbox_state(clinic: dict, conversation, patient, now: Optional[datetime] = None) -> dict:
+    """Everything the conversation page needs to show the inbox controls."""
+    now = now or datetime.now()
+    state = {"is_whatsapp": getattr(conversation, "channel", "whatsapp") == "whatsapp" and patient is not None,
+             "paused": None, "can_reply": False, "window_closes": None, "blocked": None, "latest_id": None}
+    if not state["is_whatsapp"]:
+        state["blocked"] = "phone"
+        return state
+    state["paused"] = db.get_ai_pause(patient.id, now)
+    latest = db.get_latest_whatsapp_conversation(patient.id)
+    if latest is not None and latest.id != conversation.id:
+        state["blocked"] = "not_latest"
+        state["latest_id"] = latest.id
+        return state
+    closes = handoff.window_closes_at(patient.phone_number)
+    state["window_closes"] = closes
+    if closes is None or now >= closes:
+        state["blocked"] = "window_closed"
+        return state
+    state["can_reply"] = True
+    return state
+
+
+def _render_inbox_bar(clinic: dict, conversation, inbox: dict, lang: str, qs: str) -> str:
+    if not inbox["is_whatsapp"] or inbox["blocked"] == "not_latest":
+        return ""
+    base = f'/clinic/{clinic["slug"]}/dashboard/conversation/{conversation.id}'
+    token = _inbox_token(clinic, conversation.id)
+    if inbox["paused"]:
+        text = _t("inbox_staff_active", lang).format(time=inbox["paused"]["until"].strftime("%H:%M"))
+        action, label, cls = "handback", _t("inbox_hand_back", lang), "staff"
+    else:
+        text, action, label, cls = _t("inbox_sia_active", lang), "takeover", _t("inbox_take_over", lang), "sia"
+    return (
+        f'<div class="inbox-bar {cls}"><span>{html.escape(text)}</span>'
+        f'<form method="post" action="{base}/{action}?{qs}">'
+        f'<input type="hidden" name="token" value="{token}">'
+        f'<button type="submit">{label}</button></form></div>'
+    )
+
+
 def _render_conversation_page(
     clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int,
     name_filter: str = "", date_from: str = "", date_to: str = "", sched_param: str = "",
-    lang: str = DEFAULT_LANG,
+    lang: str = DEFAULT_LANG, inbox: Optional[dict] = None, flash: str = "",
 ) -> str:
     lang = lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
     dir_attr = "rtl" if lang == "ar" else "ltr"
+    inbox = inbox or {"is_whatsapp": False, "paused": None, "can_reply": False, "window_closes": None,
+                      "blocked": "phone", "latest_id": None}
 
-    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_extra_qs(name_filter, date_from, date_to, sched_param, lang)}'
+    page_qs = f"days={days_param}{_extra_qs(name_filter, date_from, date_to, sched_param, lang)}"
+    back_url = f'/clinic/{clinic["slug"]}/dashboard?{page_qs}'
     lang_toggle_target = "ar" if lang != "ar" else "en"
     lang_toggle_url = (
         f'/clinic/{clinic["slug"]}/dashboard/conversation/{conversation.id}?days={days_param}'
         f'{_extra_qs(name_filter, date_from, date_to, sched_param, lang_toggle_target)}'
     )
+    base = f'/clinic/{clinic["slug"]}/dashboard/conversation/{conversation.id}'
 
     if conversation.flagged_for_staff:
         flag_banner = (
@@ -889,32 +1045,85 @@ def _render_conversation_page(
         age_gender_bits.append(f'{_t("col_gender", lang)} {_fmt_gender(patient.gender, lang)}')
     age_gender_html = f' · {" · ".join(age_gender_bits)}' if age_gender_bits else ""
 
-    # Only the human-readable half of the transcript -- "tool"/"agent_tool_call"
-    # rows are Sia's internal tool calls (booking lookups, etc.), not something
-    # a patient saw or a receptionist needs to read to understand the chat.
-    visible_messages = [m for m in messages if m.sender in ("user", "agent")]
     is_phone = getattr(conversation, "channel", "whatsapp") == "phone"
+    transcript_html = _render_transcript(messages, patient, is_phone, lang)
 
-    if visible_messages:
-        bubbles = ""
-        for m in visible_messages:
-            side = "patient" if m.sender == "user" else "sia"
-            agent_name = _t("voice_agent_name", lang) if is_phone else "Sia"
-            speaker = (patient.name if patient else "Patient") if side == "patient" else agent_name
-            bubbles += (
-                f'<div class="bubble-row {side}"><div>'
-                f'<div class="bubble">{html.escape(m.message)}</div>'
-                f'<div class="bubble-time">{html.escape(speaker)} · {_fmt_dt(str(m.created_at))}</div>'
-                f'</div></div>'
-            )
-        transcript_html = bubbles
+    flash_html = ""
+    if flash:
+        kind, _, code = flash.partition(":")
+        key = f"inbox_{kind}_{code}"
+        if key in TRANSLATIONS:
+            flash_html = f'<div class="flash {"ok" if kind == "ok" else "err"}">{_t(key, lang)}</div>'
+
+    inbox_bar_html = _render_inbox_bar(clinic, conversation, inbox, lang, page_qs)
+
+    if inbox["can_reply"]:
+        left = inbox["window_closes"] - datetime.now()
+        reply_html = f"""
+  <form class="reply-box" method="post" action="{base}/reply?{page_qs}">
+    <input type="hidden" name="token" value="{_inbox_token(clinic, conversation.id)}">
+    <textarea name="text" id="reply-text" maxlength="4000" placeholder="{_t('inbox_reply_placeholder', lang)}" dir="auto"></textarea>
+    <div class="reply-row">
+      <span class="window-note">{_t('inbox_window_left', lang).format(left=_fmt_left(left, lang))}</span>
+      <button type="submit">{_t('inbox_send', lang)}</button>
+    </div>
+  </form>"""
+    elif inbox["blocked"] == "window_closed":
+        reply_html = f'<div class="reply-closed">{_t("inbox_window_closed", lang)}</div>'
+    elif inbox["blocked"] == "not_latest":
+        latest_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{inbox["latest_id"]}?{page_qs}'
+        reply_html = (f'<div class="reply-closed">{_t("inbox_not_latest", lang)} '
+                      f'<a href="{latest_url}">{_t("inbox_open_latest", lang)}</a></div>')
+    elif is_phone:
+        reply_html = f'<div class="reply-closed">{_t("inbox_phone_note", lang)}</div>'
     else:
-        transcript_html = f'<div class="empty">{_t("no_messages", lang)}</div>'
+        reply_html = ""
+
+    # Live updates: every 5 s, re-fetch the transcript and the Sia/staff bar
+    # without reloading the page (a reload would wipe a half-typed reply).
+    poll_url = f'/clinic/{clinic["slug"]}/api/conversation/{conversation.id}?lang={lang}&{page_qs}'
+    live_js = f"""
+<script>
+(function () {{
+  var last = null;
+  function tick() {{
+    fetch({json.dumps(poll_url)}, {{credentials: "same-origin", cache: "no-store"}})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (d) {{
+        if (!d) return;
+        var key = d.count + "|" + d.last_id;
+        if (last !== null && key !== last) {{
+          document.getElementById("transcript").innerHTML = d.transcript_html;
+          window.scrollTo(0, document.body.scrollHeight);
+        }}
+        last = key;
+        var bar = document.getElementById("inbox-bar");
+        if (bar && bar.getAttribute("data-state") !== d.bar_state) {{
+          bar.innerHTML = d.bar_html;
+          bar.setAttribute("data-state", d.bar_state);
+        }}
+      }})
+      .catch(function () {{}});
+  }}
+  tick();
+  setInterval(tick, 5000);
+  var box = document.getElementById("reply-text");
+  if (box) {{
+    box.addEventListener("keydown", function (e) {{
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {{ e.preventDefault(); box.form.submit(); }}
+    }});
+  }}
+  window.scrollTo(0, document.body.scrollHeight);
+}})();
+</script>"""
+
+    bar_state = "phone" if not inbox["is_whatsapp"] else ("staff" if inbox["paused"] else "sia")
 
     return f"""<!doctype html>
 <html lang="{lang}" dir="{dir_attr}">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(patient.name if patient else _t('unknown_patient_title', lang))} — {html.escape(clinic['name'])}</title>
   {PAGE_STYLE}
 </head>
@@ -930,11 +1139,24 @@ def _render_conversation_page(
     · {_t('status_label', lang)}: {html.escape(conversation.status)} · {outcome_badge}
   </div>
 
+  {flash_html}
   {flag_banner}
+  <div id="inbox-bar" data-state="{bar_state}">{inbox_bar_html}</div>
 
-  <div class="transcript">{transcript_html}</div>
+  <div class="transcript" id="transcript">{transcript_html}</div>
+  {reply_html}
+  {live_js}
 </body>
 </html>"""
+
+
+def _load_conversation(clinic: dict, conversation_id: int):
+    db.set_current_db_path(clinic["db_path"])
+    conversation = db.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    patient = db.get_patient(conversation.patient_id) if conversation.patient_id else None
+    return conversation, patient
 
 
 @router.get("/clinic/{slug}/dashboard/conversation/{conversation_id}", response_class=HTMLResponse)
@@ -945,17 +1167,13 @@ async def clinic_dashboard_conversation(
     date_to: Optional[str] = Query(None, alias="to"),
     sched: Optional[str] = Query(None),
     lang: str = Query(DEFAULT_LANG),
+    flash: Optional[str] = Query(None),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
-    db.set_current_db_path(clinic["db_path"])
-    conversation = db.get_conversation(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="No such conversation")
-
-    patient = db.get_patient(conversation.patient_id) if conversation.patient_id else None
+    conversation, patient = _load_conversation(clinic, conversation_id)
     messages = db.get_messages(conversation_id)
 
     booked = False
@@ -979,7 +1197,105 @@ async def clinic_dashboard_conversation(
     return HTMLResponse(_render_conversation_page(
         clinic, conversation, patient, messages, booked, days,
         name or "", date_from or "", date_to or "", sched or "", lang,
+        inbox=_inbox_state(clinic, conversation, patient), flash=flash or "",
     ))
+
+
+@router.get("/clinic/{slug}/api/conversation/{conversation_id}")
+async def clinic_conversation_poll(
+    slug: str, conversation_id: int, request: Request,
+    lang: str = Query(DEFAULT_LANG),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    """What the open conversation page polls every few seconds: the
+    transcript and the Sia/staff bar, pre-rendered, so new patient
+    messages show up without a page reload."""
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+    lang = lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
+    conversation, patient = _load_conversation(clinic, conversation_id)
+    messages = db.get_messages(conversation_id)
+    visible = [m for m in messages if m.sender in ("user", "agent", "staff")]
+    inbox = _inbox_state(clinic, conversation, patient)
+    page_qs = "&".join(f"{k}={quote(v)}" for k, v in request.query_params.items() if k != "lang")
+    page_qs = (page_qs + "&" if page_qs else "") + f"lang={lang}"
+    is_phone = getattr(conversation, "channel", "whatsapp") == "phone"
+    return {
+        "count": len(visible),
+        "last_id": visible[-1].id if visible else None,
+        "transcript_html": _render_transcript(messages, patient, is_phone, lang),
+        "bar_state": "phone" if not inbox["is_whatsapp"] else ("staff" if inbox["paused"] else "sia"),
+        "bar_html": _render_inbox_bar(clinic, conversation, inbox, lang, page_qs),
+        "sia_paused_until": inbox["paused"]["until"].isoformat() if inbox.get("paused") else None,
+        "can_reply": inbox["can_reply"],
+    }
+
+
+def _check_inbox_post(request: Request, clinic: dict, conversation_id: int, token: str):
+    """Blocks cross-site form posts: the per-conversation token must match,
+    and when the browser says where the post came from, it must be here."""
+    origin = request.headers.get("origin")
+    if origin and origin != "null":
+        host = request.headers.get("host", "")
+        if urlparse(origin).netloc != host:
+            raise HTTPException(status_code=403, detail="Cross-site request blocked")
+    return bool(token) and hmac.compare_digest(token, _inbox_token(clinic, conversation_id))
+
+
+def _back_to_conversation(slug: str, conversation_id: int, request: Request, flash: str) -> RedirectResponse:
+    params = {k: v for k, v in request.query_params.items() if k != "flash"}
+    params["flash"] = flash
+    qs = "&".join(f"{k}={quote(v)}" for k, v in params.items())
+    return RedirectResponse(f"/clinic/{slug}/dashboard/conversation/{conversation_id}?{qs}", status_code=303)
+
+
+@router.post("/clinic/{slug}/dashboard/conversation/{conversation_id}/reply")
+async def clinic_conversation_reply(
+    slug: str, conversation_id: int, request: Request,
+    text: str = Form(""), token: str = Form(""),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+    if not _check_inbox_post(request, clinic, conversation_id, token):
+        return _back_to_conversation(slug, conversation_id, request, "err:expired")
+    conversation, _patient = _load_conversation(clinic, conversation_id)
+    try:
+        handoff.staff_reply(clinic, conversation, text, by=credentials.username)
+    except handoff.ReplyError as e:
+        return _back_to_conversation(slug, conversation_id, request, f"err:{e.code}")
+    return _back_to_conversation(slug, conversation_id, request, "ok:sent")
+
+
+@router.post("/clinic/{slug}/dashboard/conversation/{conversation_id}/takeover")
+async def clinic_conversation_takeover(
+    slug: str, conversation_id: int, request: Request, token: str = Form(""),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+    if not _check_inbox_post(request, clinic, conversation_id, token):
+        return _back_to_conversation(slug, conversation_id, request, "err:expired")
+    conversation, patient = _load_conversation(clinic, conversation_id)
+    if getattr(conversation, "channel", "whatsapp") != "whatsapp" or patient is None:
+        return _back_to_conversation(slug, conversation_id, request, "err:not_whatsapp")
+    handoff.take_over(clinic, conversation, by=credentials.username)
+    return _back_to_conversation(slug, conversation_id, request, "ok:taken")
+
+
+@router.post("/clinic/{slug}/dashboard/conversation/{conversation_id}/handback")
+async def clinic_conversation_handback(
+    slug: str, conversation_id: int, request: Request, token: str = Form(""),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+    if not _check_inbox_post(request, clinic, conversation_id, token):
+        return _back_to_conversation(slug, conversation_id, request, "err:expired")
+    conversation, patient = _load_conversation(clinic, conversation_id)
+    if patient is not None:
+        handoff.hand_back(clinic, conversation)
+    return _back_to_conversation(slug, conversation_id, request, "ok:returned")
 
 
 @router.get("/clinic/{slug}/dashboard", response_class=HTMLResponse)

@@ -95,7 +95,7 @@ class Conversation(BaseModel):
 class Message(BaseModel):
     id: int
     conversation_id: int
-    sender: str               # "user" , "agent" , "tool" or "agent_tool_call"
+    sender: str               # "user", "agent", "staff" (a manual reply from the dashboard), "tool" or "agent_tool_call"
     message: str
     created_at: datetime
 
